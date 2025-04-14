@@ -212,7 +212,6 @@ struct DuArgs {
         short = 'b',
         long = "bytes",
         help = "Print size in bytes",
-        group = "format"
     )]
     bytes: bool,
 
@@ -220,14 +219,12 @@ struct DuArgs {
         short = 'h',
         long = "human-readable",
         help = "Print sizes in human readable format (KiB, MiB etc). This is the default.",
-        group = "format"
     )]
     human: bool,
 
     #[arg(
         long = "si",
         help = "Like -h, but use powers of 1000 (KB, MB etc) not 1024",
-        group = "format"
     )]
     si: bool,
 
@@ -235,8 +232,6 @@ struct DuArgs {
         short = 'c',
         long = "count",
         help = "Count nodes instead of size. Note hard links to the same inode are counted twice.",
-        group = "format",
-        visible_alias = "count"
     )]
     count: bool,
 
@@ -257,7 +252,8 @@ struct DuArgs {
     #[arg(
         short = 'n',
         long = "limit",
-        help = "Show only first N results (after sorting)"
+        help = "Show only first N results (after sorting)",
+        value_name = "N"
     )]
     limit: Option<usize>,
 
@@ -268,7 +264,7 @@ struct DuArgs {
         short = 'r',
         long = "reverse",
         default_value_t = false,
-        help = "Sort descending instead of ascending"
+        help = "Sort ascending instead of descending"
     )]
     reverse: bool,
 
