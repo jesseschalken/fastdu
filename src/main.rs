@@ -1,7 +1,9 @@
 use clap::ArgAction;
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::fs::Metadata;
+use std::io::{stdout, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::result::Result::Ok;
@@ -52,12 +54,31 @@ impl Node {
 
         output.push(result);
     }
+
+    /// to use if -l isn't set
+    fn dedupe_inodes(self, seen: &mut HashSet<u64>) -> Option<Node> {
+        // Skip this node if it has an inode and its already seen
+        if let Some(inode) = get_inode(&self.metadata) {
+            if !seen.insert(inode) {
+                return None;
+            }
+        }
+
+        Some(Node {
+            children: self
+                .children
+                .into_iter()
+                .flat_map(|x| x.dedupe_inodes(seen))
+                .collect(),
+            ..self
+        })
+    }
 }
 
 fn get_size(metadata: &Metadata, args: &DuArgs) -> u64 {
-    if args.count {
+    if args.inodes {
         1
-    } else if !args.apparent_size {
+    } else if !args.apparent_size && !args.bytes {
         get_disk_size(&metadata)
     } else if metadata.is_file() {
         metadata.len()
@@ -88,6 +109,17 @@ fn get_device(_: &Metadata) -> Option<u64> {
     None
 }
 
+#[cfg(unix)]
+fn get_inode(metadata: &Metadata) -> Option<u64> {
+    Some(metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn get_inode(metadata: &Metadata) -> u64 {
+    // No easy way to do this on Windows
+    None
+}
+
 fn handle_error<T, E: Display>(x: Result<T, E>) -> Option<T> {
     match x {
         Ok(y) => Some(y),
@@ -103,23 +135,17 @@ fn parse_dir(
     args: &DuArgs,
     root: &Metadata,
 ) -> Result<Vec<Node>> {
-    let entries = path
-        .read_dir_utf8()
-        .with_context(|| format!("Failed to read directory {}", path))?
+    let entries = retry_interrupted(|| path.read_dir_utf8())
+        .with_context(|| format!("readdir({})", path))?
         .par_bridge()
         .map(|entry| -> Result<_> {
-            let entry = entry.with_context(|| {
-                format!("Failed to read entry in directory {}", path)
-            })?;
+            let entry = entry.with_context(|| format!("readdir({})", path))?;
             let metadata = if args.dereference_all {
-                entry
-                    .path()
-                    .metadata()
-                    .with_context(|| format!("Failed to stat {}", path))?
+                retry_interrupted(|| entry.path().metadata())
+                    .with_context(|| format!("stat({})", path))?
             } else {
-                entry
-                    .metadata()
-                    .with_context(|| format!("Failed to lstat {}", path))?
+                retry_interrupted(|| entry.metadata())
+                    .with_context(|| format!("lstat({})", path))?
             };
 
             // We have to drop entry here, otherwise it will hold the
@@ -158,17 +184,28 @@ fn parse_dir(
     Ok(nodes)
 }
 
-fn parse(path: &Utf8Path, args: &DuArgs) -> Result<Node> {
+fn retry_interrupted<T>(
+    mut f: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    loop {
+        match f() {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            x => break x,
+        }
+    }
+}
+
+fn parse(path: Utf8PathBuf, args: &DuArgs) -> Result<Node> {
     let metadata = if args.dereference_args || args.dereference_all {
-        path.metadata()
-            .with_context(|| format!("Failed to stat {}", path))?
+        retry_interrupted(|| path.metadata())
+            .with_context(|| format!("stat({})", path))?
     } else {
-        path.symlink_metadata()
-            .with_context(|| format!("Failed to lstat {}", path))?
+        retry_interrupted(|| path.symlink_metadata())
+            .with_context(|| format!("lstat({})", path))?
     };
 
     let children = if metadata.is_dir() {
-        parse_dir(path, args, &metadata)?
+        parse_dir(&path, args, &metadata)?
     } else {
         Vec::new()
     };
@@ -205,32 +242,42 @@ struct DuArgs {
     )]
     dereference_all: bool,
 
-    #[arg(
-        short = 'b',
-        long = "bytes",
-        help = "Print size in bytes",
-    )]
+    #[arg(short = 'b', long = "bytes", help = "Print size in bytes")]
     bytes: bool,
+
+    #[arg(short = None, long = "blocks", help = "Print size in 512 byte blocks. This is the default.")]
+    blocks: bool,
 
     #[arg(
         short = 'h',
         long = "human-readable",
-        help = "Print sizes in human readable format (KiB, MiB etc). This is the default.",
+        help = "Print sizes in human readable format (KiB, MiB etc)."
     )]
     human: bool,
 
+    #[arg(short = 'S', long = "sort", help = "Sort output (ascending order)")]
+    sort: bool,
+
     #[arg(
+        short = None,
         long = "si",
-        help = "Like -h, but use powers of 1000 (KB, MB etc) not 1024",
+        help = "Like -h, but use powers of 1000 (KB, MB etc) not 1024"
     )]
     si: bool,
 
     #[arg(
-        short = 'c',
-        long = "count",
-        help = "Count nodes instead of size. Note hard links to the same inode are counted twice.",
+        short = None,
+        long = "inodes",
+        help = "Count inodes instead of size."
     )]
-    count: bool,
+    inodes: bool,
+
+    #[arg(
+        short = 'l',
+        long = "count-links",
+        help = "Count sizes many times if hard linked"
+    )]
+    count_links: bool,
 
     #[arg(
         short = 'a',
@@ -261,7 +308,7 @@ struct DuArgs {
         short = 'r',
         long = "reverse",
         default_value_t = false,
-        help = "Sort ascending instead of descending"
+        help = "Sort output (descending order)"
     )]
     reverse: bool,
 
@@ -276,7 +323,7 @@ struct DuArgs {
     files_or_directories: Vec<String>,
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args: DuArgs = DuArgs::parse();
 
     ThreadPoolBuilder::new()
@@ -285,59 +332,76 @@ fn main() {
         .expect("Failed to set thread pool");
 
     let start = Instant::now();
-    let roots = args
+
+    let mut roots = args
         .files_or_directories
         .par_iter()
-        .map(Utf8Path::new)
-        .map(|p| parse(p, &args))
-        .flat_map(|x| x.inspect_err(|e| eprintln!("{:#}", e)))
+        .map(Utf8PathBuf::from)
+        .map(|path| parse(path, &args))
+        .flat_map(handle_error)
         .collect::<Vec<Node>>();
+
     eprintln!("Scanned in {:?}", Instant::now() - start);
 
-    let start = Instant::now();
+    if !args.count_links {
+        let mut seen = HashSet::new();
+        roots = roots
+            .into_iter()
+            .flat_map(|x| x.dedupe_inodes(&mut seen))
+            .collect();
+    }
+
     let mut items = vec![];
     for root in roots {
         root.flatten(None, &mut items, &args);
     }
-    eprintln!("Aggregated in {:?}", Instant::now() - start);
 
     if !args.all {
         items = items.into_iter().filter(|x| x.metadata.is_dir()).collect();
     }
 
-    let start = Instant::now();
     if args.reverse {
-        items.par_sort_unstable_by_key(|x| x.size);
-    } else {
-        items.par_sort_unstable_by_key(|x| Reverse(x.size));
+        items.par_sort_by_key(|x| Reverse(x.size));
+    } else if args.sort {
+        items.par_sort_by_key(|x| x.size);
     }
-    eprintln!("Sorted in {:?}", Instant::now() - start);
 
     if let Some(limit) = args.limit {
         items = items.into_iter().take(limit).collect();
     }
 
+    let mut stdout = stdout().lock();
     for item in items {
         let size = if args.bytes {
-            format!("{:>16} bytes", item.size)
+            format!("{} bytes", item.size)
         } else if args.si {
             format_bytes(item.size, false)
-        } else if args.count {
-            format!("{:>8} nodes", item.size)
-        } else {
+        } else if args.inodes {
+            format!("{} inodes", item.size)
+        } else if args.human {
             format_bytes(item.size, true)
+        } else {
+            format!("{} blocks", item.size / 512)
         };
-        // 12 chars for the bytes eg "1022.170 MiB"
-        println!("{:>12}  {}", size, item.path);
+
+        let result = writeln!(stdout, "{:>18}  {}", size, item.path);
+
+        // Ignore broken pipe from e.g. pipe into less
+        match result {
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => break,
+            x => x?,
+        }
     }
+
+    Ok(())
 }
 
-const BINARY_UNITS: [&str; 11] = [
-    "B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB", "RiB", "QiB",
+const BINARY_UNITS: [&str; 10] = [
+    "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB", "RiB", "QiB",
 ];
 
-const DECIMAL_UNITS: [&str; 11] = [
-    "B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB", "RB", "QB",
+const DECIMAL_UNITS: [&str; 10] = [
+    "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB", "RB", "QB",
 ];
 
 fn format_bytes(bytes: u64, binary: bool) -> String {
@@ -350,6 +414,10 @@ fn format_bytes(bytes: u64, binary: bool) -> String {
         power += 1;
     }
 
-    let unit = if binary { BINARY_UNITS } else { DECIMAL_UNITS }[power];
-    format!("{:.3} {}", bytes as f64 / factor as f64, unit)
+    if factor == 1 {
+        format!("{} B", bytes)
+    } else {
+        let unit = if binary { BINARY_UNITS } else { DECIMAL_UNITS }[power - 1];
+        format!("{:.3} {}", bytes as f64 / factor as f64, unit)
+    }
 }
