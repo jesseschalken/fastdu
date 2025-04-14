@@ -1,5 +1,5 @@
 [package]
-name = "du-rs"
+name = "fastdu"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,3 +10,4 @@ anyhow = "1.0.82"
 camino = "1.1.6"
 rayon = "1.10.0"
 clap = { version = "4.5.35", features = ["derive"] }
+once_cell = "1.21.3"
