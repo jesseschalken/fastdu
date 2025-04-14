@@ -181,10 +181,7 @@ fn parse(path: &Utf8Path, args: &DuArgs) -> Result<Node> {
 }
 
 #[derive(Parser)]
-#[command(
-    disable_help_flag = true,
-    about = "Parallel, cross-platform version of the 'du' utility"
-)]
+#[command(disable_help_flag = true)]
 struct DuArgs {
     #[arg(
         short = 'A',
