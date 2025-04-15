@@ -115,7 +115,7 @@ fn get_inode(metadata: &Metadata) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn get_inode(metadata: &Metadata) -> u64 {
+fn get_inode(_: &Metadata) -> Option<u64> {
     // No easy way to do this on Windows
     None
 }
