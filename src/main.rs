@@ -211,7 +211,7 @@ fn parse(path: Utf8PathBuf, args: &DuArgs) -> Result<Node> {
     };
 
     Ok(Node {
-        path: path.to_owned(),
+        path,
         metadata,
         children,
     })
