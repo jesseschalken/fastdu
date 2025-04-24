@@ -4,8 +4,6 @@ use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::fs::Metadata;
 use std::io::{stdout, ErrorKind, Write};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 use std::result::Result::Ok;
 use std::time::Instant;
 
@@ -89,6 +87,7 @@ fn get_size(metadata: &Metadata, args: &DuArgs) -> u64 {
 
 #[cfg(unix)]
 fn get_disk_size(metadata: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     metadata.blocks() * 512
 }
 
@@ -100,6 +99,7 @@ fn get_disk_size(metadata: &Metadata) -> u64 {
 
 #[cfg(unix)]
 fn get_device(metadata: &Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
     Some(metadata.dev())
 }
 
@@ -111,6 +111,7 @@ fn get_device(_: &Metadata) -> Option<u64> {
 
 #[cfg(unix)]
 fn get_inode(metadata: &Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
     Some(metadata.ino())
 }
 
