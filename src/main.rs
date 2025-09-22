@@ -3,43 +3,53 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::fs::Metadata;
-use std::io::{stdout, ErrorKind, Write};
+use std::io::{ErrorKind, Write, stdout};
 use std::result::Result::Ok;
 use std::time::Instant;
 
 use anyhow::*;
 use camino::*;
-use clap::{arg, Parser};
-use rayon::prelude::*;
+use clap::{Parser, arg};
 use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 
 #[derive(Debug)]
 struct Node {
-    path: Utf8PathBuf,
-    metadata: Metadata,
-    children: Vec<Node>,
+    path: Box<Utf8Path>,
+    size: u64,
+    is_dir: bool,
+    inode: Option<u64>,
+    children: Box<[Node]>,
 }
 
 #[derive(Debug)]
 struct FlatNode {
     size: u64,
-    metadata: Metadata,
-    path: Utf8PathBuf,
+    is_dir: bool,
+    path: Box<Utf8Path>,
 }
 
 impl Node {
+    fn new(path: Box<Utf8Path>, metadata: &Metadata, args: &DuArgs) -> Self {
+        Node {
+            path,
+            size: get_size(metadata, args),
+            is_dir: metadata.is_dir(),
+            inode: get_inode(metadata),
+            children: Default::default(),
+        }
+    }
+
     fn flatten(
         self,
         parent: Option<&mut FlatNode>,
         output: &mut Vec<FlatNode>,
         args: &DuArgs,
     ) {
-        let size = get_size(&self.metadata, args);
-
         let mut result = FlatNode {
             path: self.path,
-            metadata: self.metadata,
-            size,
+            is_dir: self.is_dir,
+            size: self.size,
         };
 
         for child in self.children {
@@ -56,7 +66,7 @@ impl Node {
     /// to use if -l isn't set
     fn dedupe_inodes(self, seen: &mut HashSet<u64>) -> Option<Node> {
         // Skip this node if it has an inode and its already seen
-        if let Some(inode) = get_inode(&self.metadata) {
+        if let Some(inode) = self.inode {
             if !seen.insert(inode) {
                 return None;
             }
@@ -138,53 +148,48 @@ fn handle_error<T, E: Display>(x: Result<T, E>) -> Option<T> {
 fn parse_dir(
     path: &Utf8Path,
     args: &DuArgs,
-    root: &Metadata,
-) -> Result<Vec<Node>> {
-    let entries = retry_interrupted(|| path.read_dir_utf8())
+    root_dev: Option<u64>,
+) -> Result<Box<[Node]>> {
+    let nodes = retry_interrupted(|| path.read_dir_utf8())
         .with_context(|| format!("readdir({})", path))?
-        .par_bridge()
-        .map(|entry| -> Result<_> {
-            let entry = entry.with_context(|| format!("readdir({})", path))?;
-            let metadata = if args.dereference_all {
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .flat_map_iter(|entry| -> Option<_> {
+            let entry = handle_error(
+                entry.with_context(|| format!("readdir({})", path)),
+            )?;
+            let metadata = handle_error(if args.dereference_all {
                 retry_interrupted(|| entry.path().metadata())
-                    .with_context(|| format!("stat({})", path))?
+                    .with_context(|| format!("stat({})", path))
             } else {
                 retry_interrupted(|| entry.metadata())
-                    .with_context(|| format!("lstat({})", path))?
-            };
+                    .with_context(|| format!("lstat({})", path))
+            })?;
+
+            if args.one_file_system && get_device(&metadata) != root_dev {
+                return None;
+            }
+
+            let path = entry.into_path();
+            let node = Node::new(path.into(), &metadata, args);
 
             // We have to drop entry here, otherwise it will hold the
             // directory handle open.
-            Ok((entry.into_path(), metadata))
-        })
-        .flat_map(handle_error)
-        .filter(|(_, metadata)| {
-            if args.one_file_system {
-                get_device(metadata) == get_device(root)
-            } else {
-                true
-            }
+            Some(node)
         })
         // Collect into a vector so that we drop the directory handle before
         // traversing the children and don't get a "Too many open files" error.
-        .collect::<Vec<_>>();
-
-    let nodes = entries
+        .collect::<Vec<Node>>()
         .into_par_iter()
-        .map(|(path, metadata)| -> Result<_> {
-            let children = if metadata.is_dir() {
-                parse_dir(&path, args, root)?
-            } else {
-                Vec::new()
-            };
-            Ok(Node {
-                path,
-                metadata,
-                children,
-            })
+        .map(|mut node| {
+            if node.is_dir {
+                node.children =
+                    handle_error(parse_dir(&node.path, args, root_dev))
+                        .unwrap_or_default();
+            }
+            node
         })
-        .flat_map(handle_error)
-        .collect::<Vec<Node>>();
+        .collect();
 
     Ok(nodes)
 }
@@ -200,7 +205,7 @@ fn retry_interrupted<T>(
     }
 }
 
-fn parse(path: Utf8PathBuf, args: &DuArgs) -> Result<Node> {
+fn parse(path: Box<Utf8Path>, args: &DuArgs) -> Result<Node> {
     let metadata = if args.dereference_args || args.dereference_all {
         retry_interrupted(|| path.metadata())
             .with_context(|| format!("stat({})", path))?
@@ -209,17 +214,15 @@ fn parse(path: Utf8PathBuf, args: &DuArgs) -> Result<Node> {
             .with_context(|| format!("lstat({})", path))?
     };
 
-    let children = if metadata.is_dir() {
-        parse_dir(&path, args, &metadata)?
-    } else {
-        Vec::new()
-    };
+    let mut node = Node::new(path, &metadata, args);
 
-    Ok(Node {
-        path,
-        metadata,
-        children,
-    })
+    if node.is_dir {
+        node.children =
+            handle_error(parse_dir(&node.path, args, get_device(&metadata)))
+                .unwrap_or_default();
+    }
+
+    Ok(node)
 }
 
 #[derive(Parser)]
@@ -338,13 +341,11 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
 
-    let mut roots = args
+    let mut roots: Vec<Node> = args
         .files_or_directories
         .par_iter()
-        .map(Utf8PathBuf::from)
-        .map(|path| parse(path, &args))
-        .flat_map(handle_error)
-        .collect::<Vec<Node>>();
+        .flat_map_iter(|path| handle_error(parse(path.into(), &args)))
+        .collect();
 
     let end = Instant::now();
     let count = roots.iter().map(Node::total_count).sum::<usize>();
@@ -371,7 +372,7 @@ fn main() -> Result<()> {
     }
 
     if !args.all {
-        items = items.into_iter().filter(|x| x.metadata.is_dir()).collect();
+        items = items.into_iter().filter(|x| x.is_dir).collect();
     }
 
     if args.reverse {
