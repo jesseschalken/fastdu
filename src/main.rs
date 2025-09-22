@@ -4,33 +4,33 @@ use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::fs::Metadata;
 use std::io::{ErrorKind, Write, stdout};
+use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
 use std::time::Instant;
 
 use anyhow::*;
-use camino::*;
 use clap::{Parser, arg};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 
 #[derive(Debug)]
 struct Node {
-    path: Box<Utf8Path>,
+    path: PathBuf,
     size: u64,
     is_dir: bool,
     inode: Option<u64>,
-    children: Box<[Node]>,
+    children: Vec<Node>,
 }
 
 #[derive(Debug)]
 struct FlatNode {
     size: u64,
     is_dir: bool,
-    path: Box<Utf8Path>,
+    path: PathBuf,
 }
 
 impl Node {
-    fn new(path: Box<Utf8Path>, metadata: &Metadata, args: &DuArgs) -> Self {
+    fn new(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Self {
         Node {
             path,
             size: get_size(metadata, args),
@@ -136,50 +136,57 @@ fn get_inode(_: &Metadata) -> Option<u64> {
 }
 
 fn handle_error<T, E: Display>(x: Result<T, E>) -> Option<T> {
-    match x {
-        Ok(y) => Some(y),
-        Err(e) => {
-            eprintln!("{:#}", e);
-            None
-        }
-    }
+    x.inspect_err(|e| eprintln!("{:#}", e)).ok()
 }
 
 fn parse_dir(
-    path: &Utf8Path,
+    path: &Path,
     args: &DuArgs,
     root_dev: Option<u64>,
-) -> Result<Box<[Node]>> {
-    let nodes = retry_interrupted(|| path.read_dir_utf8())
-        .with_context(|| format!("readdir({})", path))?
-        .collect::<Vec<_>>()
-        .into_par_iter()
+) -> Result<Vec<Node>> {
+    // readdir()
+    let entries: Vec<_> = retry_interrupted(|| path.read_dir())
+        .and_then(Iterator::collect)
+        .with_context(|| format!("readdir({})", path.display()))?;
+
+    // stat()/lstat() on children in parallel
+    let mut nodes: Vec<_> = entries
+        .par_iter()
         .flat_map_iter(|entry| -> Option<_> {
-            let entry = handle_error(
-                entry.with_context(|| format!("readdir({})", path)),
-            )?;
+            let path = entry.path();
             let metadata = handle_error(if args.dereference_all {
-                retry_interrupted(|| entry.path().metadata())
-                    .with_context(|| format!("stat({})", path))
+                retry_interrupted(|| path.metadata())
+                    .with_context(|| format!("stat({})", path.display()))
             } else {
-                retry_interrupted(|| entry.metadata())
-                    .with_context(|| format!("lstat({})", path))
+                retry_interrupted(|| {
+                    if cfg!(unix) {
+                        // On Unix entry.metadata() is the same as
+                        // entry.path().symlink_metadata(), so reuse our existing
+                        // PathBuf in that case.
+                        path.symlink_metadata()
+                    } else {
+                        entry.metadata()
+                    }
+                })
+                .with_context(|| format!("lstat({})", path.display()))
             })?;
 
             if args.one_file_system && get_device(&metadata) != root_dev {
                 return None;
             }
 
-            let path = entry.into_path();
             let node = Node::new(path.into(), &metadata, args);
 
-            // We have to drop entry here, otherwise it will hold the
-            // directory handle open.
             Some(node)
         })
-        // Collect into a vector so that we drop the directory handle before
-        // traversing the children and don't get a "Too many open files" error.
-        .collect::<Vec<Node>>()
+        .collect();
+
+    // We have to drop entries here, otherwise it will hold the
+    // directory handle open.
+    drop(entries);
+
+    // Recurse on children in parallel
+    nodes = nodes
         .into_par_iter()
         .map(|mut node| {
             if node.is_dir {
@@ -205,13 +212,13 @@ fn retry_interrupted<T>(
     }
 }
 
-fn parse(path: Box<Utf8Path>, args: &DuArgs) -> Result<Node> {
+fn parse(path: PathBuf, args: &DuArgs) -> Result<Node> {
     let metadata = if args.dereference_args || args.dereference_all {
         retry_interrupted(|| path.metadata())
-            .with_context(|| format!("stat({})", path))?
+            .with_context(|| format!("stat({})", path.display()))?
     } else {
         retry_interrupted(|| path.symlink_metadata())
-            .with_context(|| format!("lstat({})", path))?
+            .with_context(|| format!("lstat({})", path.display()))?
     };
 
     let mut node = Node::new(path, &metadata, args);
@@ -344,7 +351,9 @@ fn main() -> Result<()> {
     let mut roots: Vec<Node> = args
         .files_or_directories
         .par_iter()
-        .flat_map_iter(|path| handle_error(parse(path.into(), &args)))
+        .flat_map_iter(|path| {
+            handle_error(parse(Path::new(path).into(), &args))
+        })
         .collect();
 
     let end = Instant::now();
@@ -399,7 +408,7 @@ fn main() -> Result<()> {
             format!("{} blocks", item.size / 512)
         };
 
-        let result = writeln!(stdout, "{:>18}  {}", size, item.path);
+        let result = writeln!(stdout, "{:>18}  {}", size, item.path.display());
 
         // Ignore broken pipe from e.g. pipe into less
         match result {
