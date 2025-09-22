@@ -387,12 +387,12 @@ fn main() -> Result<()> {
 
     let mut stdout = stdout().lock();
     for item in items {
-        let size = if args.bytes {
+        let size = if args.inodes {
+            format!("{} inodes", item.size)
+        } else if args.bytes {
             format!("{} bytes", item.size)
         } else if args.si {
             format_bytes(item.size, false)
-        } else if args.inodes {
-            format!("{} inodes", item.size)
         } else if args.human {
             format_bytes(item.size, true)
         } else {
