@@ -71,6 +71,10 @@ impl Node {
             ..self
         })
     }
+
+    fn total_count(&self) -> usize {
+        1 + self.children.iter().map(Node::total_count).sum::<usize>()
+    }
 }
 
 fn get_size(metadata: &Metadata, args: &DuArgs) -> u64 {
@@ -342,7 +346,16 @@ fn main() -> Result<()> {
         .flat_map(handle_error)
         .collect::<Vec<Node>>();
 
-    eprintln!("Scanned in {:?}", Instant::now() - start);
+    let end = Instant::now();
+    let count = roots.iter().map(Node::total_count).sum::<usize>();
+    let secs = (end - start).as_secs_f64();
+
+    eprintln!(
+        "Scanned {} nodes in {:.3} seconds ({:.0} nodes/s)",
+        count,
+        secs,
+        count as f64 / secs
+    );
 
     if !args.count_links {
         let mut seen = HashSet::new();
