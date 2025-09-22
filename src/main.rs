@@ -397,14 +397,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-const BINARY_UNITS: [&str; 10] = [
-    "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB", "RiB", "QiB",
-];
-
-const DECIMAL_UNITS: [&str; 10] = [
-    "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB", "RB", "QB",
-];
-
 fn format_bytes(bytes: u64, binary: bool) -> String {
     let kilo = if binary { 1024 } else { 1000 };
 
@@ -415,10 +407,14 @@ fn format_bytes(bytes: u64, binary: bool) -> String {
         power += 1;
     }
 
-    if factor == 1 {
-        format!("{} B", bytes)
-    } else {
-        let unit = if binary { BINARY_UNITS } else { DECIMAL_UNITS }[power - 1];
-        format!("{:.3} {}", bytes as f64 / factor as f64, unit)
+    match power {
+        0 => format!("{} B", bytes),
+        1 => format!("{} {}", bytes, if binary { "KiB" } else { "kB" }),
+        _ => format!(
+            "{:.3} {}{}",
+            bytes as f64 / factor as f64,
+            b" KMGTPEZYRQ"[power] as char,
+            if binary { "iB" } else { "B" },
+        ),
     }
 }
