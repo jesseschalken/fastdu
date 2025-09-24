@@ -6,6 +6,7 @@ use std::fs::Metadata;
 use std::io::{ErrorKind, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
+use std::thread::available_parallelism;
 use std::time::Instant;
 
 use anyhow::*;
@@ -15,28 +16,48 @@ use rayon::prelude::*;
 
 #[derive(Debug)]
 struct Node {
-    path: PathBuf,
-    size: u64,
+    path: Box<Path>,
     is_dir: bool,
-    inode: Option<u64>,
-    children: Vec<Node>,
+    size: u64,
+    inode: u64,
+    device: u64,
+    children: Box<[Node]>,
 }
 
 #[derive(Debug)]
 struct FlatNode {
     size: u64,
     is_dir: bool,
-    path: PathBuf,
+    path: Box<Path>,
 }
 
 impl Node {
-    fn new(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Self {
-        Node {
+    #[cfg(unix)]
+    fn new(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
             path,
-            size: get_size(metadata, args),
             is_dir: metadata.is_dir(),
-            inode: get_inode(metadata),
+            size: if args.apparent_size || args.bytes {
+                metadata.len()
+            } else {
+                metadata.blocks() * 512
+            },
+            inode: metadata.ino(),
+            device: metadata.dev(),
             children: Default::default(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn new(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Self {
+        Self {
+            path,
+            children: Default::default(),
+            is_dir: metadata.is_dir(),
+            size: metadata.len(),
+            inode: 0,
+            device: 0,
         }
     }
 
@@ -49,7 +70,7 @@ impl Node {
         let mut result = FlatNode {
             path: self.path,
             is_dir: self.is_dir,
-            size: self.size,
+            size: if args.inodes { 1 } else { self.size },
         };
 
         for child in self.children {
@@ -64,19 +85,16 @@ impl Node {
     }
 
     /// to use if -l isn't set
-    fn dedupe_inodes(self, seen: &mut HashSet<u64>) -> Option<Node> {
-        // Skip this node if it has an inode and its already seen
-        if let Some(inode) = self.inode {
-            if !seen.insert(inode) {
-                return None;
-            }
+    fn dedupe_inodes(self, seen: &mut HashSet<(u64, u64)>) -> Option<Node> {
+        if !seen.insert((self.device, self.inode)) {
+            return None;
         }
 
         Some(Node {
             children: self
                 .children
                 .into_iter()
-                .flat_map(|x| x.dedupe_inodes(seen))
+                .flat_map(|node| node.dedupe_inodes(seen))
                 .collect(),
             ..self
         })
@@ -87,76 +105,24 @@ impl Node {
     }
 }
 
-fn get_size(metadata: &Metadata, args: &DuArgs) -> u64 {
-    if args.inodes {
-        1
-    } else if !args.apparent_size && !args.bytes {
-        get_disk_size(&metadata)
-    } else if metadata.is_file() {
-        metadata.len()
-    } else {
-        0
-    }
-}
-
-#[cfg(unix)]
-fn get_disk_size(metadata: &Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.blocks() * 512
-}
-
-#[cfg(not(unix))]
-fn get_disk_size(metadata: &Metadata) -> u64 {
-    // No easy way to do this on Windows
-    metadata.len()
-}
-
-#[cfg(unix)]
-fn get_device(metadata: &Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(metadata.dev())
-}
-
-#[cfg(not(unix))]
-fn get_device(_: &Metadata) -> Option<u64> {
-    // No easy way to do this on Windows
-    None
-}
-
-#[cfg(unix)]
-fn get_inode(metadata: &Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(metadata.ino())
-}
-
-#[cfg(not(unix))]
-fn get_inode(_: &Metadata) -> Option<u64> {
-    // No easy way to do this on Windows
-    None
-}
-
 fn handle_error<T, E: Display>(x: Result<T, E>) -> Option<T> {
     x.inspect_err(|e| eprintln!("{:#}", e)).ok()
 }
 
-fn parse_dir(
-    path: &Path,
-    args: &DuArgs,
-    root_dev: Option<u64>,
-) -> Result<Vec<Node>> {
-    // readdir()
-    let entries: Vec<_> = retry_interrupted(|| path.read_dir())
-        .and_then(Iterator::collect)
-        .with_context(|| format!("readdir({})", path.display()))?;
-
-    // stat()/lstat() on children in parallel
-    let mut nodes: Vec<_> = entries
-        .par_iter()
-        .flat_map_iter(|entry| -> Option<_> {
+fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>> {
+    let mut nodes: Box<_> = retry_interrupted(|| path.read_dir())
+        .with_context(|| format!("opendir({})", path.display()))?
+        // DirEntry is expensive to move so put it in a Box ASAP
+        .map(|result| result.map(Box::new))
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|entry| -> Result<_> {
+            let entry = entry
+                .with_context(|| format!("readdir({})", path.display()))?;
             let path = entry.path();
-            let metadata = handle_error(if args.dereference_all {
+            let metadata = if args.dereference_all {
                 retry_interrupted(|| path.metadata())
-                    .with_context(|| format!("stat({})", path.display()))
+                    .with_context(|| format!("stat({})", path.display()))?
             } else {
                 retry_interrupted(|| {
                     if cfg!(unix) {
@@ -168,35 +134,21 @@ fn parse_dir(
                         entry.metadata()
                     }
                 })
-                .with_context(|| format!("lstat({})", path.display()))
-            })?;
+                .with_context(|| format!("lstat({})", path.display()))?
+            };
 
-            if args.one_file_system && get_device(&metadata) != root_dev {
-                return None;
-            }
-
-            let node = Node::new(path.into(), &metadata, args);
-
-            Some(node)
+            Ok(Node::new(path.into(), &metadata, args))
         })
+        .flat_map_iter(handle_error)
+        .filter(|node| !args.one_file_system || node.device == root.device)
         .collect();
 
-    // We have to drop entries here, otherwise it will hold the
-    // directory handle open.
-    drop(entries);
-
-    // Recurse on children in parallel
-    nodes = nodes
-        .into_par_iter()
-        .map(|mut node| {
-            if node.is_dir {
-                node.children =
-                    handle_error(parse_dir(&node.path, args, root_dev))
-                        .unwrap_or_default();
-            }
-            node
-        })
-        .collect();
+    nodes.par_iter_mut().for_each(|node| {
+        if node.is_dir {
+            node.children = handle_error(parse_dir(&node.path, args, root))
+                .unwrap_or_default();
+        }
+    });
 
     Ok(nodes)
 }
@@ -221,13 +173,12 @@ fn parse(path: PathBuf, args: &DuArgs) -> Result<Node> {
             .with_context(|| format!("lstat({})", path.display()))?
     };
 
-    let mut node = Node::new(path, &metadata, args);
+    let mut node = Node::new(path.into(), &metadata, args);
 
     if node.is_dir {
         node.children =
-            handle_error(parse_dir(&node.path, args, get_device(&metadata)))
-                .unwrap_or_default();
-    }
+            handle_error(parse_dir(&node.path, args, &node)).unwrap_or_default()
+    };
 
     Ok(node)
 }
@@ -290,7 +241,7 @@ struct DuArgs {
     #[arg(
         short = 'l',
         long = "count-links",
-        help = "Count sizes many times if hard linked"
+        help = "Count sizes many times if hard linked. No effect on Windows."
     )]
     count_links: bool,
 
@@ -304,7 +255,7 @@ struct DuArgs {
     #[arg(
         short = 'x',
         long = "one-file-system",
-        help = "Skip nodes on different file systems"
+        help = "Skip nodes on different file systems. No effect on Windows."
     )]
     one_file_system: bool,
 
@@ -330,19 +281,29 @@ struct DuArgs {
     #[arg(
         short = 'j',
         long = "threads",
-        help = "Thread count, defaults to number of CPU cores"
+        help = "Thread count, defaults to 2x the number of CPU cores"
     )]
-    threads: Option<usize>,
+    num_threads: Option<usize>,
 
     #[arg(help = "Files or directories to scan")]
     files_or_directories: Vec<String>,
+}
+
+fn default_num_threads() -> usize {
+    if let Ok(cores) = available_parallelism() {
+        cores.get() * 2
+    } else {
+        1
+    }
 }
 
 fn main() -> Result<()> {
     let args: DuArgs = DuArgs::parse();
 
     ThreadPoolBuilder::new()
-        .num_threads(args.threads.unwrap_or(0))
+        // Include the current thread so with -j1 no threads need to be spawned
+        .use_current_thread()
+        .num_threads(args.num_threads.unwrap_or_else(default_num_threads))
         .build_global()
         .expect("Failed to set thread pool");
 
@@ -351,13 +312,11 @@ fn main() -> Result<()> {
     let mut roots: Vec<Node> = args
         .files_or_directories
         .par_iter()
-        .flat_map_iter(|path| {
-            handle_error(parse(Path::new(path).into(), &args))
-        })
+        .flat_map(|path| handle_error(parse(path.into(), &args)))
         .collect();
 
     let end = Instant::now();
-    let count = roots.iter().map(Node::total_count).sum::<usize>();
+    let count: usize = roots.iter().map(Node::total_count).sum();
     let secs = (end - start).as_secs_f64();
 
     eprintln!(
@@ -367,7 +326,7 @@ fn main() -> Result<()> {
         count as f64 / secs
     );
 
-    if !args.count_links {
+    if !args.count_links && cfg!(unix) {
         let mut seen = HashSet::new();
         roots = roots
             .into_iter()
@@ -394,22 +353,30 @@ fn main() -> Result<()> {
         items = items.into_iter().take(limit).collect();
     }
 
+    items.shrink_to_fit();
+
+    let output: Box<[Box<str>]> = items
+        .par_iter()
+        .map(|item| {
+            let size = if args.inodes {
+                format!("{} inodes", item.size)
+            } else if args.bytes {
+                format!("{} bytes", item.size)
+            } else if args.si {
+                format_bytes(item.size, false)
+            } else if args.human {
+                format_bytes(item.size, true)
+            } else {
+                format!("{} blocks", item.size / 512)
+            };
+
+            format!("{:>18}  {}\n", size, item.path.display()).into()
+        })
+        .collect();
+
     let mut stdout = stdout().lock();
-    for item in items {
-        let size = if args.inodes {
-            format!("{} inodes", item.size)
-        } else if args.bytes {
-            format!("{} bytes", item.size)
-        } else if args.si {
-            format_bytes(item.size, false)
-        } else if args.human {
-            format_bytes(item.size, true)
-        } else {
-            format!("{} blocks", item.size / 512)
-        };
-
-        let result = writeln!(stdout, "{:>18}  {}", size, item.path.display());
-
+    for line in output {
+        let result = stdout.write_all(line.as_bytes());
         // Ignore broken pipe from e.g. pipe into less
         match result {
             Err(e) if e.kind() == ErrorKind::BrokenPipe => break,
