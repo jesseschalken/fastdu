@@ -114,7 +114,7 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>> {
         .with_context(|| format!("opendir({})", path.display()))?
         // DirEntry is expensive to move so put it in a Box ASAP
         .map(|result| result.map(Box::new))
-        .collect::<Vec<_>>()
+        .collect::<Box<_>>()
         .into_par_iter()
         .map(|entry| -> Result<_> {
             let entry = entry
@@ -373,6 +373,8 @@ fn main() -> Result<()> {
             format!("{:>18}  {}\n", size, item.path.display()).into()
         })
         .collect();
+
+    drop(items);
 
     let mut stdout = stdout().lock();
     for line in output {
