@@ -31,78 +31,74 @@ struct FlatNode {
     path: Box<Path>,
 }
 
-impl Node {
-    #[cfg(unix)]
-    fn new(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Self {
-        use std::os::unix::fs::MetadataExt;
-        Self {
-            path,
-            is_dir: metadata.is_dir(),
-            size: if args.apparent_size || args.bytes {
-                metadata.len()
-            } else {
-                metadata.blocks() * 512
-            },
-            inode: metadata.ino(),
-            device: metadata.dev(),
-            children: Default::default(),
-        }
+#[cfg(unix)]
+fn create_node(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Node {
+    use std::os::unix::fs::MetadataExt;
+    Node {
+        path,
+        is_dir: metadata.is_dir(),
+        size: if args.inodes {
+            1
+        } else if args.apparent_size || args.bytes {
+            metadata.len()
+        } else {
+            metadata.blocks() * 512
+        },
+        inode: metadata.ino(),
+        device: metadata.dev(),
+        children: Default::default(),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_node(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Node {
+    Node {
+        path,
+        children: Default::default(),
+        is_dir: metadata.is_dir(),
+        size: if args.inodes { 1 } else { metadata.len() },
+        inode: 0,
+        device: 0,
+    }
+}
+
+fn flatten(
+    node: Node,
+    output: &mut Vec<FlatNode>,
+    parent: Option<&mut FlatNode>,
+) {
+    let mut result =
+        FlatNode { path: node.path, is_dir: node.is_dir, size: node.size };
+
+    for child in node.children {
+        flatten(child, output, Some(&mut result));
     }
 
-    #[cfg(not(unix))]
-    fn new(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Self {
-        Self {
-            path,
-            children: Default::default(),
-            is_dir: metadata.is_dir(),
-            size: metadata.len(),
-            inode: 0,
-            device: 0,
-        }
+    if let Some(parent) = parent {
+        parent.size += result.size;
     }
 
-    fn flatten(
-        self,
-        parent: Option<&mut FlatNode>,
-        output: &mut Vec<FlatNode>,
-        args: &DuArgs,
-    ) {
-        let mut result = FlatNode {
-            path: self.path,
-            is_dir: self.is_dir,
-            size: if args.inodes { 1 } else { self.size },
-        };
+    output.push(result);
+}
 
-        for child in self.children {
-            child.flatten(Some(&mut result), output, args);
-        }
-
-        if let Some(parent) = parent {
-            parent.size += result.size;
-        }
-
-        output.push(result);
-    }
-
-    /// to use if -l isn't set
-    fn dedupe_inodes(self, seen: &mut HashSet<(u64, u64)>) -> Option<Node> {
-        if !seen.insert((self.device, self.inode)) {
-            return None;
-        }
-
-        Some(Node {
-            children: self
-                .children
-                .into_iter()
-                .flat_map(|node| node.dedupe_inodes(seen))
-                .collect(),
-            ..self
+/// to use if -l isn't set
+fn dedupe_inodes(
+    nodes: Box<[Node]>,
+    seen: &mut HashSet<(u64, u64)>,
+) -> Box<[Node]> {
+    nodes
+        .into_iter()
+        .flat_map(|node| {
+            if !seen.insert((node.device, node.inode)) {
+                return None;
+            }
+            Some(Node { children: dedupe_inodes(node.children, seen), ..node })
         })
-    }
+        .collect()
+}
 
-    fn total_count(&self) -> usize {
-        1 + self.children.iter().map(Node::total_count).sum::<usize>()
-    }
+fn total_count(node: &Node) -> usize {
+    1 + node.children.iter().map(total_count).sum::<usize>()
 }
 
 fn handle_error<T, E: Display>(x: Result<T, E>) -> Option<T> {
@@ -137,7 +133,7 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>> {
                 .with_context(|| format!("lstat({})", path.display()))?
             };
 
-            Ok(Node::new(path.into(), &metadata, args))
+            Ok(create_node(path.into(), &metadata, args))
         })
         .flat_map_iter(handle_error)
         .filter(|node| !args.one_file_system || node.device == root.device)
@@ -173,7 +169,7 @@ fn parse(path: PathBuf, args: &DuArgs) -> Result<Node> {
             .with_context(|| format!("lstat({})", path.display()))?
     };
 
-    let mut node = Node::new(path.into(), &metadata, args);
+    let mut node = create_node(path.into(), &metadata, args);
 
     if node.is_dir {
         node.children =
@@ -290,11 +286,7 @@ struct DuArgs {
 }
 
 fn default_num_threads() -> usize {
-    if let Ok(cores) = available_parallelism() {
-        cores.get() * 2
-    } else {
-        1
-    }
+    available_parallelism().map(|cores| cores.get() * 2).unwrap_or(1)
 }
 
 fn main() -> Result<()> {
@@ -309,14 +301,14 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
 
-    let mut roots: Vec<Node> = args
+    let mut roots: Box<[Node]> = args
         .files_or_directories
         .par_iter()
-        .flat_map(|path| handle_error(parse(path.into(), &args)))
+        .flat_map_iter(|path| handle_error(parse(path.into(), &args)))
         .collect();
 
     let end = Instant::now();
-    let count: usize = roots.iter().map(Node::total_count).sum();
+    let count: usize = roots.iter().map(total_count).sum();
     let secs = (end - start).as_secs_f64();
 
     eprintln!(
@@ -327,16 +319,12 @@ fn main() -> Result<()> {
     );
 
     if !args.count_links && cfg!(unix) {
-        let mut seen = HashSet::new();
-        roots = roots
-            .into_iter()
-            .flat_map(|x| x.dedupe_inodes(&mut seen))
-            .collect();
+        roots = dedupe_inodes(roots, &mut HashSet::new());
     }
 
     let mut items = vec![];
     for root in roots {
-        root.flatten(None, &mut items, &args);
+        flatten(root, &mut items, None);
     }
 
     if !args.all {
