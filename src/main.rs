@@ -67,8 +67,8 @@ fn flatten(
     output: &mut Vec<FlatNode>,
     parent: Option<&mut FlatNode>,
 ) {
-    let mut result =
-        FlatNode { path: node.path, is_dir: node.is_dir, size: node.size };
+    let Node { path, is_dir, size, .. } = node;
+    let mut result = FlatNode { path, is_dir, size };
 
     for child in node.children {
         flatten(child, output, Some(&mut result));
