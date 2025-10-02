@@ -10,3 +10,7 @@ description = "Concurrent, cross-platform version of du"
 anyhow = "1.0.82"
 rayon = "1.10.0"
 clap = { version = "4.5.35", features = ["derive"] }
+
+[[bin]]
+name = "fastdu"
+path = "main.rs"
