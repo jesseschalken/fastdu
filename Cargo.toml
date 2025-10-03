@@ -7,7 +7,6 @@ description = "Concurrent, cross-platform version of du"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.82"
 rayon = "1.10.0"
 clap = { version = "4.5.35", features = ["derive"] }
 

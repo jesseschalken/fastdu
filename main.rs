@@ -5,11 +5,11 @@ use std::fmt::{Debug, Display};
 use std::fs::Metadata;
 use std::io::{ErrorKind, Write, stdout};
 use std::path::{Path, PathBuf};
+use std::result::Result;
 use std::result::Result::Ok;
 use std::thread::available_parallelism;
 use std::time::Instant;
 
-use anyhow::*;
 use clap::{Parser, arg};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
@@ -100,42 +100,50 @@ fn total_count(node: &Node) -> usize {
     1 + node.children.iter().map(total_count).sum::<usize>()
 }
 
+#[inline]
 fn handle_error<T, E: Display>(x: Result<T, E>) -> Option<T> {
-    x.inspect_err(|e| eprintln!("{:#}", e)).ok()
+    x.inspect_err(|e| eprintln!("{}", e)).ok()
 }
 
-fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>> {
-    let mut nodes: Box<_> = retry_interrupted(|| path.read_dir())
-        .with_context(|| format!("opendir({})", path.display()))?
-        // DirEntry is expensive to move so put it in a Box ASAP
-        .map(|result| result.map(Box::new))
-        .collect::<Box<_>>()
-        .into_par_iter()
-        .map(|entry| -> Result<_> {
-            let entry = entry.with_context(|| format!("readdir({})", path.display()))?;
-            let path = entry.path();
-            let metadata = if args.dereference_all {
-                retry_interrupted(|| path.metadata())
-                    .with_context(|| format!("stat({})", path.display()))?
-            } else {
-                retry_interrupted(|| {
-                    if cfg!(unix) {
+fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>, Box<str>> {
+    let mut iter = retry_interrupted(|| path.read_dir())
+        .map_err(|e| format!("opendir({}): {}", path.display(), e))?;
+
+    let mut nodes = Vec::new();
+
+    loop {
+        match iter.next().as_ref().map(Result::as_ref) {
+            Some(Ok(entry)) => {
+                let path = entry.path();
+                let metadata = if args.dereference_all {
+                    retry_interrupted(|| path.metadata())
+                        .map_err(|e| format!("stat({}): {}", path.display(), e))
+                } else {
+                    retry_interrupted(|| {
                         // On Unix entry.metadata() is the same as
                         // entry.path().symlink_metadata(), so reuse our existing
                         // PathBuf in that case.
-                        path.symlink_metadata()
-                    } else {
-                        entry.metadata()
-                    }
-                })
-                .with_context(|| format!("lstat({})", path.display()))?
-            };
+                        if cfg!(unix) {
+                            path.symlink_metadata()
+                        } else {
+                            entry.metadata()
+                        }
+                    })
+                    .map_err(|e| format!("lstat({}): {}", path.display(), e))
+                };
 
-            Ok(create_node(path.into(), &metadata, args))
-        })
-        .flat_map_iter(handle_error)
-        .filter(|node| !args.one_file_system || node.device == root.device)
-        .collect();
+                if let Some(metadata) = handle_error(metadata.as_ref()) {
+                    nodes.push(create_node(path.into(), metadata, args));
+                }
+            }
+            Some(Err(e)) => {
+                eprintln!("readdir({}): {}", path.display(), e);
+            }
+            None => break,
+        }
+    }
+
+    nodes.shrink_to_fit();
 
     nodes.par_iter_mut().for_each(|node| {
         if node.is_dir {
@@ -143,9 +151,10 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>> {
         }
     });
 
-    Ok(nodes)
+    Ok(nodes.into())
 }
 
+#[inline]
 fn retry_interrupted<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     loop {
         match f() {
@@ -155,13 +164,13 @@ fn retry_interrupted<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::R
     }
 }
 
-fn parse(path: PathBuf, args: &DuArgs) -> Result<Node> {
+fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, Box<str>> {
     let metadata = if args.dereference_args || args.dereference_all {
         retry_interrupted(|| path.metadata())
-            .with_context(|| format!("stat({})", path.display()))?
+            .map_err(|e| format!("stat({}): {}", path.display(), e))?
     } else {
         retry_interrupted(|| path.symlink_metadata())
-            .with_context(|| format!("lstat({})", path.display()))?
+            .map_err(|e| format!("lstat({}): {}", path.display(), e))?
     };
 
     let mut node = create_node(path.into(), &metadata, args);
@@ -285,7 +294,7 @@ fn default_num_threads() -> usize {
         .unwrap_or(1)
 }
 
-fn main() -> Result<()> {
+fn main() -> std::io::Result<()> {
     let args: DuArgs = DuArgs::parse();
 
     ThreadPoolBuilder::new()
