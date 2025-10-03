@@ -62,13 +62,12 @@ fn create_node(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Node {
     }
 }
 
-fn flatten(
-    node: Node,
-    output: &mut Vec<FlatNode>,
-    parent: Option<&mut FlatNode>,
-) {
-    let Node { path, is_dir, size, .. } = node;
-    let mut result = FlatNode { path, is_dir, size };
+fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: Option<&mut FlatNode>) {
+    let mut result = FlatNode {
+        path: node.path,
+        is_dir: node.is_dir,
+        size: node.size,
+    };
 
     for child in node.children {
         flatten(child, output, Some(&mut result));
@@ -82,17 +81,17 @@ fn flatten(
 }
 
 /// to use if -l isn't set
-fn dedupe_inodes(
-    nodes: Box<[Node]>,
-    seen: &mut HashSet<(u64, u64)>,
-) -> Box<[Node]> {
+fn dedupe_inodes(nodes: Box<[Node]>, seen: &mut HashSet<(u64, u64)>) -> Box<[Node]> {
     nodes
         .into_iter()
         .flat_map(|node| {
             if !seen.insert((node.device, node.inode)) {
                 return None;
             }
-            Some(Node { children: dedupe_inodes(node.children, seen), ..node })
+            Some(Node {
+                children: dedupe_inodes(node.children, seen),
+                ..node
+            })
         })
         .collect()
 }
@@ -113,8 +112,7 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>> {
         .collect::<Box<_>>()
         .into_par_iter()
         .map(|entry| -> Result<_> {
-            let entry = entry
-                .with_context(|| format!("readdir({})", path.display()))?;
+            let entry = entry.with_context(|| format!("readdir({})", path.display()))?;
             let path = entry.path();
             let metadata = if args.dereference_all {
                 retry_interrupted(|| path.metadata())
@@ -141,17 +139,14 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>> {
 
     nodes.par_iter_mut().for_each(|node| {
         if node.is_dir {
-            node.children = handle_error(parse_dir(&node.path, args, root))
-                .unwrap_or_default();
+            node.children = handle_error(parse_dir(&node.path, args, root)).unwrap_or_default();
         }
     });
 
     Ok(nodes)
 }
 
-fn retry_interrupted<T>(
-    mut f: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
+fn retry_interrupted<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     loop {
         match f() {
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -172,8 +167,7 @@ fn parse(path: PathBuf, args: &DuArgs) -> Result<Node> {
     let mut node = create_node(path.into(), &metadata, args);
 
     if node.is_dir {
-        node.children =
-            handle_error(parse_dir(&node.path, args, &node)).unwrap_or_default()
+        node.children = handle_error(parse_dir(&node.path, args, &node)).unwrap_or_default()
     };
 
     Ok(node)
@@ -286,7 +280,9 @@ struct DuArgs {
 }
 
 fn default_num_threads() -> usize {
-    available_parallelism().map(|cores| cores.get() * 2).unwrap_or(1)
+    available_parallelism()
+        .map(|cores| cores.get() * 2)
+        .unwrap_or(1)
 }
 
 fn main() -> Result<()> {
