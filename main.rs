@@ -101,49 +101,54 @@ fn total_count(node: &Node) -> usize {
 }
 
 #[inline]
-fn handle_error<T, E: Display>(x: Result<T, E>) -> Option<T> {
-    x.inspect_err(|e| eprintln!("{}", e)).ok()
+fn handle_error<T, E: Display>(result: Result<T, E>) -> Option<T> {
+    match result {
+        Ok(v) => return Some(v),
+        Err(e) => eprintln!("{}", e),
+    }
+    return None;
 }
 
 fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>, Box<str>> {
-    let mut iter = retry_interrupted(|| path.read_dir())
+    let mut iter = retry_if_interrupted(|| path.read_dir())
         .map_err(|e| format!("opendir({}): {}", path.display(), e))?;
 
     let mut nodes = Vec::new();
 
-    loop {
-        match iter.next().as_ref().map(Result::as_ref) {
-            Some(Ok(entry)) => {
-                let path = entry.path();
-                let metadata = if args.dereference_all {
-                    retry_interrupted(|| path.metadata())
-                        .map_err(|e| format!("stat({}): {}", path.display(), e))
+    // Take a ref immediately to avoid moving the DirEntry which is very large
+    while let Some(result) = &iter.next() {
+        let result = result
+            .as_ref()
+            .map_err(|e| format!("readdir({}): {}", path.display(), e));
+
+        let Some(entry) = handle_error(result) else {
+            continue;
+        };
+        let path = entry.path();
+        let metadata = if args.dereference_all {
+            retry_if_interrupted(|| path.metadata())
+                .map_err(|e| format!("stat({}): {}", path.display(), e))
+        } else {
+            retry_if_interrupted(|| {
+                // On Unix entry.metadata() is the same as
+                // entry.path().symlink_metadata(), so reuse our existing
+                // PathBuf in that case.
+                if cfg!(unix) {
+                    path.symlink_metadata()
                 } else {
-                    retry_interrupted(|| {
-                        // On Unix entry.metadata() is the same as
-                        // entry.path().symlink_metadata(), so reuse our existing
-                        // PathBuf in that case.
-                        if cfg!(unix) {
-                            path.symlink_metadata()
-                        } else {
-                            entry.metadata()
-                        }
-                    })
-                    .map_err(|e| format!("lstat({}): {}", path.display(), e))
-                };
-
-                if let Some(metadata) = handle_error(metadata.as_ref()) {
-                    nodes.push(create_node(path.into(), metadata, args));
+                    entry.metadata()
                 }
-            }
-            Some(Err(e)) => {
-                eprintln!("readdir({}): {}", path.display(), e);
-            }
-            None => break,
-        }
-    }
+            })
+            .map_err(|e| format!("lstat({}): {}", path.display(), e))
+        };
 
-    nodes.shrink_to_fit();
+        // as_ref() to avoid moving the Metadata
+        let Some(metadata) = handle_error(metadata.as_ref()) else {
+            continue;
+        };
+
+        nodes.push(create_node(path.into(), metadata, args));
+    }
 
     nodes.par_iter_mut().for_each(|node| {
         if node.is_dir {
@@ -155,21 +160,24 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>, Box
 }
 
 #[inline]
-fn retry_interrupted<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+fn retry_if_interrupted<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     loop {
-        match f() {
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            x => break x,
+        let result = f();
+        if let Err(e) = &result
+            && e.kind() == ErrorKind::Interrupted
+        {
+            continue;
         }
+        return result;
     }
 }
 
-fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, Box<str>> {
+fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, String> {
     let metadata = if args.dereference_args || args.dereference_all {
-        retry_interrupted(|| path.metadata())
+        retry_if_interrupted(|| path.metadata())
             .map_err(|e| format!("stat({}): {}", path.display(), e))?
     } else {
-        retry_interrupted(|| path.symlink_metadata())
+        retry_if_interrupted(|| path.symlink_metadata())
             .map_err(|e| format!("lstat({}): {}", path.display(), e))?
     };
 
