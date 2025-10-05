@@ -110,16 +110,12 @@ fn handle_error<T, E: Display>(result: Result<T, E>) -> Option<T> {
     return None;
 }
 
-fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Vec<Node> {
+fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, String> {
     let mut dir_handle = retry_if_interrupted(|| path.read_dir());
 
-    let Some(iter) = handle_error(
-        dir_handle
-            .as_mut()
-            .map_err(|e| format!("opendir({}): {e}", path.display())),
-    ) else {
-        return Vec::new();
-    };
+    let iter = dir_handle
+        .as_mut()
+        .map_err(|e| format!("opendir({}): {e}", path.display()))?;
 
     let mut nodes = Vec::new();
 
@@ -164,11 +160,13 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Vec<Node> {
 
     nodes.par_iter_mut().for_each(|node| {
         if node.is_dir {
-            node.children = parse_dir(&node.path, args, root).into();
+            node.children = handle_error(parse_dir(&node.path, args, root))
+                .unwrap_or_default()
+                .into();
         }
     });
 
-    nodes
+    Ok(nodes)
 }
 
 #[inline]
@@ -200,7 +198,9 @@ fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, String> {
     let mut node = create_node(path, metadata, args);
 
     if node.is_dir {
-        node.children = parse_dir(&node.path, args, &node).into()
+        node.children = handle_error(parse_dir(&node.path, args, &node))
+            .unwrap_or_default()
+            .into()
     }
 
     Ok(node)
