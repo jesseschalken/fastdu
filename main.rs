@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::fs::Metadata;
+use std::io;
 use std::io::{ErrorKind, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::result::Result;
@@ -32,10 +33,10 @@ struct FlatNode {
 }
 
 #[cfg(unix)]
-fn create_node(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Node {
+fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
     use std::os::unix::fs::MetadataExt;
     Node {
-        path,
+        path: path.into(),
         is_dir: metadata.is_dir(),
         size: if args.inodes {
             1
@@ -51,9 +52,9 @@ fn create_node(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Node {
 }
 
 #[cfg(not(unix))]
-fn create_node(path: Box<Path>, metadata: &Metadata, args: &DuArgs) -> Node {
+fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
     Node {
-        path,
+        path: path.into(),
         children: Default::default(),
         is_dir: metadata.is_dir(),
         size: if args.inodes { 1 } else { metadata.len() },
@@ -81,7 +82,7 @@ fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: Option<&mut FlatNode>
 }
 
 /// to use if -l isn't set
-fn dedupe_inodes(nodes: Box<[Node]>, seen: &mut HashSet<(u64, u64)>) -> Box<[Node]> {
+fn dedupe_inodes(nodes: Vec<Node>, seen: &mut HashSet<(u64, u64)>) -> Vec<Node> {
     nodes
         .into_iter()
         .flat_map(|node| {
@@ -89,7 +90,7 @@ fn dedupe_inodes(nodes: Box<[Node]>, seen: &mut HashSet<(u64, u64)>) -> Box<[Nod
                 return None;
             }
             Some(Node {
-                children: dedupe_inodes(node.children, seen),
+                children: dedupe_inodes(node.children.into(), seen).into(),
                 ..node
             })
         })
@@ -109,9 +110,13 @@ fn handle_error<T, E: Display>(result: Result<T, E>) -> Option<T> {
     return None;
 }
 
-fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>, Box<str>> {
-    let mut iter = retry_if_interrupted(|| path.read_dir())
-        .map_err(|e| format!("opendir({}): {}", path.display(), e))?;
+fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Vec<Node> {
+    let Some(mut iter) = handle_error(
+        retry_if_interrupted(|| path.read_dir())
+            .map_err(|e| format!("opendir({}): {e}", path.display())),
+    ) else {
+        return Vec::new();
+    };
 
     let mut nodes = Vec::new();
 
@@ -119,48 +124,52 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Box<[Node]>, Box
     while let Some(result) = &iter.next() {
         let result = result
             .as_ref()
-            .map_err(|e| format!("readdir({}): {}", path.display(), e));
-
-        let Some(entry) = handle_error(result) else {
-            continue;
-        };
-        let path = entry.path();
-        let metadata = if args.dereference_all {
-            retry_if_interrupted(|| path.metadata())
-                .map_err(|e| format!("stat({}): {}", path.display(), e))
-        } else {
-            retry_if_interrupted(|| {
-                // On Unix entry.metadata() is the same as
-                // entry.path().symlink_metadata(), so reuse our existing
-                // PathBuf in that case.
-                if cfg!(unix) {
-                    path.symlink_metadata()
+            .map_err(|e| format!("readdir({}): {e}", path.display()))
+            .and_then(|entry| -> Result<_, _> {
+                let path = entry.path();
+                let syscall;
+                let metadata = if args.dereference_all {
+                    syscall = "stat";
+                    retry_if_interrupted(|| path.metadata())
                 } else {
-                    entry.metadata()
-                }
-            })
-            .map_err(|e| format!("lstat({}): {}", path.display(), e))
-        };
+                    syscall = "lstat";
+                    // On macOS entry.metadata() just does entry.path().symlink_metadata()
+                    // but we can reuse `path` in that case.
+                    if cfg!(target_vendor = "apple") {
+                        retry_if_interrupted(|| path.symlink_metadata())
+                    } else {
+                        retry_if_interrupted(|| entry.metadata())
+                    }
+                };
 
-        // as_ref() to avoid moving the Metadata
-        let Some(metadata) = handle_error(metadata.as_ref()) else {
-            continue;
-        };
+                let metadata = metadata
+                    .as_ref()
+                    .map_err(|e| format!("{syscall}({}): {e}", path.display()))?;
 
-        nodes.push(create_node(path.into(), metadata, args));
+                Ok(create_node(path, metadata, args))
+            });
+
+        if let Some(node) = handle_error(result) {
+            if args.one_file_system && node.device != root.device {
+                continue;
+            }
+            nodes.push(node);
+        }
     }
+
+    drop(iter);
 
     nodes.par_iter_mut().for_each(|node| {
         if node.is_dir {
-            node.children = handle_error(parse_dir(&node.path, args, root)).unwrap_or_default();
+            node.children = parse_dir(&node.path, args, root).into();
         }
     });
 
-    Ok(nodes.into())
+    nodes
 }
 
 #[inline]
-fn retry_if_interrupted<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         let result = f();
         if let Err(e) = &result
@@ -173,19 +182,23 @@ fn retry_if_interrupted<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io
 }
 
 fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, String> {
+    let syscall;
     let metadata = if args.dereference_args || args.dereference_all {
+        syscall = "stat";
         retry_if_interrupted(|| path.metadata())
-            .map_err(|e| format!("stat({}): {}", path.display(), e))?
     } else {
+        syscall = "lstat";
         retry_if_interrupted(|| path.symlink_metadata())
-            .map_err(|e| format!("lstat({}): {}", path.display(), e))?
     };
+    let metadata = metadata
+        .as_ref()
+        .map_err(|e| format!("{syscall}({}): {e}", path.display()))?;
 
-    let mut node = create_node(path.into(), &metadata, args);
+    let mut node = create_node(path, metadata, args);
 
     if node.is_dir {
-        node.children = handle_error(parse_dir(&node.path, args, &node)).unwrap_or_default()
-    };
+        node.children = parse_dir(&node.path, args, &node).into()
+    }
 
     Ok(node)
 }
@@ -314,7 +327,7 @@ fn main() -> std::io::Result<()> {
 
     let start = Instant::now();
 
-    let mut roots: Box<[Node]> = args
+    let mut roots: Vec<Node> = args
         .files_or_directories
         .par_iter()
         .flat_map_iter(|path| handle_error(parse(path.into(), &args)))
