@@ -158,11 +158,15 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Strin
 
     drop(dir_handle);
 
-    nodes.par_iter_mut().for_each(|node| {
-        if node.is_dir {
-            node.children = handle_error(parse_dir(&node.path, args, root))
-                .unwrap_or_default()
-                .into();
+    rayon::scope(|scope| {
+        for node in &mut nodes {
+            if node.is_dir {
+                scope.spawn(|_| {
+                    node.children = handle_error(parse_dir(&node.path, args, root))
+                        .unwrap_or_default()
+                        .into();
+                });
+            }
         }
     });
 
