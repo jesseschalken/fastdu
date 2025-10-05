@@ -158,17 +158,19 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Strin
 
     drop(dir_handle);
 
-    rayon::scope(|scope| {
-        for node in &mut nodes {
-            if node.is_dir {
-                scope.spawn(|_| {
-                    node.children = handle_error(parse_dir(&node.path, args, root))
-                        .unwrap_or_default()
-                        .into();
-                });
-            }
-        }
-    });
+    // Collect directories into a vector first to avoid rayon overheads for files.
+    // par_bridge() is slower because it involves synchronization per item.
+    // rayon::scope() is slower because each task gets malloc'd.
+    nodes
+        .iter_mut()
+        .filter(|node| node.is_dir)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .for_each(|node| {
+            node.children = handle_error(parse_dir(&node.path, args, root))
+                .unwrap_or_default()
+                .into();
+        });
 
     Ok(nodes)
 }
