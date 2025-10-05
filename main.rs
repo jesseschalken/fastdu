@@ -111,8 +111,11 @@ fn handle_error<T, E: Display>(result: Result<T, E>) -> Option<T> {
 }
 
 fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Vec<Node> {
-    let Some(mut iter) = handle_error(
-        retry_if_interrupted(|| path.read_dir())
+    let mut dir_handle = retry_if_interrupted(|| path.read_dir());
+
+    let Some(iter) = handle_error(
+        dir_handle
+            .as_mut()
             .map_err(|e| format!("opendir({}): {e}", path.display())),
     ) else {
         return Vec::new();
@@ -157,7 +160,7 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Vec<Node> {
         }
     }
 
-    drop(iter);
+    drop(dir_handle);
 
     nodes.par_iter_mut().for_each(|node| {
         if node.is_dir {
