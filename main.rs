@@ -111,16 +111,13 @@ fn handle_error<T, E: Display>(result: Result<T, E>) -> Option<T> {
 }
 
 fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, String> {
-    let mut dir_handle = retry_if_interrupted(|| path.read_dir());
-
-    let iter = dir_handle
-        .as_mut()
-        .map_err(|e| format!("opendir({}): {e}", path.display()))?;
-
     let mut nodes = Vec::new();
 
-    // Take a ref immediately to avoid moving the DirEntry which is very large
-    while let Some(result) = &iter.next() {
+    for result in retry_if_interrupted(|| path.read_dir())
+        .as_mut()
+        .map_err(|e| format!("opendir({}): {e}", path.display()))?
+    {
+        // Take a ref immediately to avoid moving the DirEntry which is very large
         let result = result
             .as_ref()
             .map_err(|e| format!("readdir({}): {e}", path.display()))
@@ -155,8 +152,6 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Strin
             nodes.push(node);
         }
     }
-
-    drop(dir_handle);
 
     // Collect directories into a vector first to avoid rayon overheads for files.
     // par_bridge() is slower because it involves synchronization per item.
