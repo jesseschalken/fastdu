@@ -166,6 +166,7 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Strin
         .filter(|node| node.is_dir)
         .collect::<Vec<_>>()
         .into_par_iter()
+        .with_max_len(1)
         .for_each(|node| {
             node.children = handle_error(parse_dir(&node.path, args, root))
                 .unwrap_or_default()
@@ -339,6 +340,7 @@ fn main() -> std::io::Result<()> {
     let mut roots: Vec<Node> = args
         .files_or_directories
         .par_iter()
+        .with_max_len(1)
         .flat_map_iter(|path| handle_error(parse(path.into(), &args)))
         .collect();
 
