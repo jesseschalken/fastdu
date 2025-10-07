@@ -16,7 +16,7 @@ pub trait DirEntryLike {
     }
 }
 
-impl DirEntryLike for Path {
+impl DirEntryLike for &Path {
     fn path(&self) -> PathBuf {
         self.to_path_buf()
     }
@@ -26,30 +26,30 @@ impl DirEntryLike for Path {
     }
 }
 
-impl DirEntryLike for DirEntry {
+impl DirEntryLike for &DirEntry {
     fn path(&self) -> PathBuf {
-        self.path()
+        (*self).path()
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        self.metadata()
+        (*self).metadata()
     }
 
     fn file_type(&self) -> Option<Result<FileType>> {
-        Some(self.file_type())
+        Some((*self).file_type())
     }
 }
 
-pub struct FsNodeState<'a, T: DirEntryLike + ?Sized> {
-    entry: &'a T,
+pub struct FsNodeState<T: DirEntryLike> {
+    entry: T,
     follow_links: bool,
     path: OnceCell<PathBuf>,
     file_type: OnceCell<Result<FileType>>,
     metadata: OnceCell<Result<Metadata>>,
 }
 
-impl<'a, T: DirEntryLike + ?Sized> FsNodeState<'a, T> {
-    pub fn new(entry: &'a T, follow_links: bool) -> Self {
+impl<T: DirEntryLike> FsNodeState<T> {
+    pub fn new(entry: T, follow_links: bool) -> Self {
         FsNodeState {
             entry,
             follow_links,
@@ -112,7 +112,7 @@ pub fn scan_tree<T: Send + Sync, Fn1, Fn2>(
 ) -> Result<Vec<T>>
 where
     T: Send + Sync,
-    Fn1: Fn(&mut FsNodeState<DirEntry>) -> Result<Option<Fn2>> + Sync,
+    Fn1: Fn(&mut FsNodeState<&DirEntry>) -> Result<Option<Fn2>> + Sync,
     Fn2: FnOnce(Result<Vec<T>>) -> Result<Option<T>> + Send,
 {
     let mut files = Vec::new();

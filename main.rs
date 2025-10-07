@@ -40,10 +40,7 @@ struct FlatNode {
 }
 
 #[cfg(unix)]
-fn create_node<T: DirEntryLike + ?Sized>(
-    entry: &mut FsNodeState<T>,
-    args: &DuArgs,
-) -> Result<Node, Error> {
+fn create_node<T: DirEntryLike>(entry: &mut FsNodeState<T>, args: &DuArgs) -> Result<Node, Error> {
     use std::os::unix::fs::MetadataExt;
     let (inode, device) = if !args.count_links || args.one_file_system {
         let metadata = entry.metadata()?;
@@ -68,10 +65,7 @@ fn create_node<T: DirEntryLike + ?Sized>(
 }
 
 #[cfg(not(unix))]
-fn create_node<T: DirEntryLike + ?Sized>(
-    entry: &mut FsNodeState<T>,
-    args: &DuArgs,
-) -> Result<Node, Error> {
+fn create_node<T: DirEntryLike>(entry: &mut FsNodeState<T>, args: &DuArgs) -> Result<Node, Error> {
     Node {
         path: entry.take_path().into(),
         children: Default::default(),
@@ -134,7 +128,7 @@ fn handle_error<T, E: Display>(result: Result<T, E>) -> Option<T> {
 }
 
 fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Error> {
-    let handler = |entry: &mut FsNodeState<DirEntry>| {
+    let handler = |entry: &mut FsNodeState<&DirEntry>| {
         let mut node = create_node(entry, args)?;
 
         if args.one_file_system && node.device != root.device {
