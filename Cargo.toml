@@ -13,3 +13,11 @@ clap = { version = "4.5.35", features = ["derive"] }
 [[bin]]
 name = "fastdu"
 path = "main.rs"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+strip = "none"
+incremental = false
+panic = "abort"
