@@ -1,9 +1,10 @@
+mod scanner;
+
 use clap::ArgAction;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
-use std::fs::Metadata;
-use std::io;
+use std::fs::DirEntry;
 use std::io::{ErrorKind, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::result::Result;
@@ -14,6 +15,12 @@ use std::time::Instant;
 use clap::{Parser, arg};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
+
+use crate::scanner::DirEntryLike;
+use crate::scanner::FsNodeState;
+use crate::scanner::scan_tree;
+
+type Error = std::io::Error;
 
 #[derive(Debug)]
 struct Node {
@@ -33,31 +40,47 @@ struct FlatNode {
 }
 
 #[cfg(unix)]
-fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
+fn create_node<T: DirEntryLike + ?Sized>(
+    entry: &mut FsNodeState<T>,
+    args: &DuArgs,
+) -> Result<Node, Error> {
     use std::os::unix::fs::MetadataExt;
-    Node {
-        path: path.into(),
-        is_dir: metadata.is_dir(),
+    let (inode, device) = if !args.count_links || args.one_file_system {
+        let metadata = entry.metadata()?;
+        (metadata.ino(), metadata.dev())
+    } else {
+        (0, 0)
+    };
+    Ok(Node {
+        path: entry.take_path().into(),
+        is_dir: entry.file_type()?.is_dir(),
         size: if args.inodes {
             1
         } else if args.apparent_size || args.bytes {
-            metadata.len()
+            entry.metadata()?.len()
         } else {
-            metadata.blocks() * 512
+            entry.metadata()?.blocks() * 512
         },
-        inode: metadata.ino(),
-        device: metadata.dev(),
+        inode,
+        device,
         children: Default::default(),
-    }
+    })
 }
 
 #[cfg(not(unix))]
-fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
+fn create_node<T: DirEntryLike + ?Sized>(
+    entry: &mut FsNodeState<T>,
+    args: &DuArgs,
+) -> Result<Node, Error> {
     Node {
-        path: path.into(),
+        path: entry.take_path().into(),
         children: Default::default(),
-        is_dir: metadata.is_dir(),
-        size: if args.inodes { 1 } else { metadata.len() },
+        is_dir: entry.file_type()?.is_dir(),
+        size: if args.inodes {
+            1
+        } else {
+            entry.metadata()?.len()
+        },
         inode: 0,
         device: 0,
     }
@@ -110,94 +133,30 @@ fn handle_error<T, E: Display>(result: Result<T, E>) -> Option<T> {
     return None;
 }
 
-fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, String> {
-    let mut nodes = Vec::new();
+fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Error> {
+    let handler = |entry: &mut FsNodeState<DirEntry>| {
+        let mut node = create_node(entry, args)?;
 
-    for result in retry_if_interrupted(|| path.read_dir())
-        .as_mut()
-        .map_err(|e| format!("opendir({}): {e}", path.display()))?
-    {
-        // Take a ref immediately to avoid moving the DirEntry which is very large
-        let result = result
-            .as_ref()
-            .map_err(|e| format!("readdir({}): {e}", path.display()))
-            .and_then(|entry| -> Result<_, _> {
-                let path = entry.path();
-                let syscall;
-                let metadata = if args.dereference_all {
-                    syscall = "stat";
-                    retry_if_interrupted(|| path.metadata())
-                } else {
-                    syscall = "lstat";
-                    // On macOS entry.metadata() just does entry.path().symlink_metadata()
-                    // but we can reuse `path` in that case.
-                    if cfg!(target_vendor = "apple") {
-                        retry_if_interrupted(|| path.symlink_metadata())
-                    } else {
-                        retry_if_interrupted(|| entry.metadata())
-                    }
-                };
-
-                let metadata = metadata
-                    .as_ref()
-                    .map_err(|e| format!("{syscall}({}): {e}", path.display()))?;
-
-                Ok(create_node(path, metadata, args))
-            });
-
-        if let Some(node) = handle_error(result) {
-            if args.one_file_system && node.device != root.device {
-                continue;
-            }
-            nodes.push(node);
+        if args.one_file_system && node.device != root.device {
+            return Ok(None);
         }
-    }
 
-    // Collect directories into a vector first to avoid rayon overheads for files.
-    // par_bridge() is slower because it involves synchronization per item.
-    // rayon::scope() is slower because each task gets malloc'd.
-    nodes
-        .iter_mut()
-        .filter(|node| node.is_dir)
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .with_max_len(1)
-        .for_each(|node| {
-            node.children = handle_error(parse_dir(&node.path, args, root))
-                .unwrap_or_default()
-                .into();
-        });
-
-    Ok(nodes)
-}
-
-#[inline]
-fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    loop {
-        let result = f();
-        if let Err(e) = &result
-            && e.kind() == ErrorKind::Interrupted
-        {
-            continue;
-        }
-        return result;
-    }
-}
-
-fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, String> {
-    let syscall;
-    let metadata = if args.dereference_args || args.dereference_all {
-        syscall = "stat";
-        retry_if_interrupted(|| path.metadata())
-    } else {
-        syscall = "lstat";
-        retry_if_interrupted(|| path.symlink_metadata())
+        Ok(Some(move |children: Result<Vec<Node>, Error>| {
+            node.children = handle_error(children).unwrap_or_default().into();
+            Ok(Some(node))
+        }))
     };
-    let metadata = metadata
-        .as_ref()
-        .map_err(|e| format!("{syscall}({}): {e}", path.display()))?;
 
-    let mut node = create_node(path, metadata, args);
+    scan_tree(path, &handler, args.dereference_all)
+}
+
+fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, Error> {
+    let mut state = FsNodeState::new(
+        path.as_path(),
+        args.dereference_args || args.dereference_all,
+    );
+
+    let mut node = create_node(&mut state, args)?;
 
     if node.is_dir {
         node.children = handle_error(parse_dir(&node.path, args, &node))
