@@ -14,6 +14,10 @@ pub trait DirEntryLike {
     fn file_type(&self) -> Option<Result<FileType>> {
         None
     }
+    #[cfg(unix)]
+    fn ino(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl DirEntryLike for &Path {
@@ -28,7 +32,7 @@ impl DirEntryLike for &Path {
 
 impl DirEntryLike for &DirEntry {
     fn path(&self) -> PathBuf {
-        (*self).path()
+        (*self).path().into()
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -37,6 +41,12 @@ impl DirEntryLike for &DirEntry {
 
     fn file_type(&self) -> Option<Result<FileType>> {
         Some((*self).file_type())
+    }
+
+    #[cfg(unix)]
+    fn ino(&self) -> Option<u64> {
+        use std::os::unix::fs::DirEntryExt;
+        Some((*self).ino())
     }
 }
 
@@ -67,6 +77,16 @@ impl<T: DirEntryLike> FsNodeState<T> {
         self.path.get_or_init(|| self.entry.path())
     }
 
+    #[cfg(unix)]
+    pub fn ino(&self) -> Result<u64> {
+        if let Some(ino) = self.entry.ino() {
+            Ok(ino)
+        } else {
+            use std::os::unix::fs::MetadataExt;
+            self.metadata().map(|m| m.ino())
+        }
+    }
+
     pub fn file_type(&self) -> Result<FileType> {
         if self.follow_links {
             Ok(self.metadata()?.file_type())
@@ -74,11 +94,12 @@ impl<T: DirEntryLike> FsNodeState<T> {
             return Ok(metadata.file_type());
         } else {
             self.file_type
-                .get_or_init(|| -> Result<_> {
-                    self.entry
-                        .file_type()
-                        .unwrap_or_else(|| self.metadata().map(|m| m.file_type()))
-                        .map_err(|e| add_context(&self.path())(e))
+                .get_or_init(|| {
+                    if let Some(result) = self.entry.file_type() {
+                        result.map_err(add_context(|| &self.path()))
+                    } else {
+                        self.metadata().map(|m| m.file_type())
+                    }
                 })
                 .as_ref()
                 .map_err(copy_io_error)
@@ -98,7 +119,7 @@ impl<T: DirEntryLike> FsNodeState<T> {
                 } else {
                     self.entry.metadata()
                 }
-                .map_err(|e| add_context(&self.path())(e))
+                .map_err(add_context(|| &self.path()))
             })
             .as_ref()
             .map_err(copy_io_error)
@@ -118,8 +139,8 @@ where
     let mut files = Vec::new();
     let mut dirs = Vec::new();
 
-    for entry in path.read_dir().as_mut().map_err(add_context(path))? {
-        let entry = entry.as_ref().map_err(add_context(path))?;
+    for entry in path.read_dir().as_mut().map_err(add_context(|| path))? {
+        let entry = entry.as_ref().map_err(add_context(|| path))?;
         let mut state = FsNodeState::new(entry, follow_links);
         let Some(fn2) = handler(&mut state)? else {
             continue;
@@ -154,10 +175,10 @@ fn join_unordered<T>(mut big: Vec<T>, mut small: Vec<T>) -> Vec<T> {
     big
 }
 
-pub fn add_context<E: Borrow<Error>>(p: &Path) -> impl FnOnce(E) -> Error {
+pub fn add_context<'a, E: Borrow<Error>>(p: impl FnOnce() -> &'a Path) -> impl FnOnce(E) -> Error {
     move |e| {
         let e: &Error = e.borrow();
-        Error::new(e.kind(), format!("{}: {}", p.display(), e))
+        Error::new(e.kind(), format!("{}: {}", p().display(), e))
     }
 }
 

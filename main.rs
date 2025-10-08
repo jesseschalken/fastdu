@@ -43,8 +43,7 @@ struct FlatNode {
 fn create_node<T: DirEntryLike>(entry: &mut FsNodeState<T>, args: &DuArgs) -> Result<Node, Error> {
     use std::os::unix::fs::MetadataExt;
     let (inode, device) = if !args.count_links || args.one_file_system {
-        let metadata = entry.metadata()?;
-        (metadata.ino(), metadata.dev())
+        (entry.ino()?, entry.metadata()?.dev())
     } else {
         (0, 0)
     };
