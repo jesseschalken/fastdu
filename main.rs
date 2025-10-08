@@ -1,11 +1,10 @@
-mod scanner;
-
 use clap::ArgAction;
+use std::borrow::Borrow;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
-use std::fs::DirEntry;
-use std::io::{ErrorKind, Write, stdout};
+use std::fs::Metadata;
+use std::io::{self, ErrorKind, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::result::Result;
 use std::result::Result::Ok;
@@ -15,10 +14,6 @@ use std::time::Instant;
 use clap::{Parser, arg};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
-
-use crate::scanner::DirEntryLike;
-use crate::scanner::FsNodeState;
-use crate::scanner::scan_tree;
 
 type Error = std::io::Error;
 
@@ -40,40 +35,35 @@ struct FlatNode {
 }
 
 #[cfg(unix)]
-fn create_node<T: DirEntryLike>(entry: &mut FsNodeState<T>, args: &DuArgs) -> Result<Node, Error> {
+fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
     use std::os::unix::fs::MetadataExt;
-    let (inode, device) = if !args.count_links || args.one_file_system {
-        (entry.ino()?, entry.metadata()?.dev())
-    } else {
-        (0, 0)
-    };
-    Ok(Node {
-        path: entry.take_path().into(),
-        is_dir: entry.file_type()?.is_dir(),
+    Node {
+        path: path.into(),
+        is_dir: metadata.is_dir(),
         size: if args.inodes {
             1
         } else if args.apparent_size || args.bytes {
-            entry.metadata()?.len()
+            metadata.len()
         } else {
-            entry.metadata()?.blocks() * 512
+            metadata.blocks() * 512
         },
-        inode,
-        device,
+        inode: if args.count_links { 0 } else { metadata.ino() },
+        device: if args.count_links && !args.one_file_system {
+            0
+        } else {
+            metadata.dev()
+        },
         children: Default::default(),
-    })
+    }
 }
 
 #[cfg(not(unix))]
-fn create_node<T: DirEntryLike>(entry: &mut FsNodeState<T>, args: &DuArgs) -> Result<Node, Error> {
+fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Result<Node, Error> {
     Node {
-        path: entry.take_path().into(),
+        path: path.into(),
         children: Default::default(),
-        is_dir: entry.file_type()?.is_dir(),
-        size: if args.inodes {
-            1
-        } else {
-            entry.metadata()?.len()
-        },
+        is_dir: metadata.is_dir(),
+        size: if args.inodes { 1 } else { metadata.len() },
         inode: 0,
         device: 0,
     }
@@ -126,30 +116,65 @@ fn handle_error<T, E: Display>(result: Result<T, E>) -> Option<T> {
     return None;
 }
 
-fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Error> {
-    let handler = |entry: &mut FsNodeState<&DirEntry>| {
-        let mut node = create_node(entry, args)?;
-
-        if args.one_file_system && node.device != root.device {
-            return Ok(None);
+#[inline]
+fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        let result = f();
+        if let Err(e) = &result
+            && e.kind() == ErrorKind::Interrupted
+        {
+            continue;
         }
+        return result;
+    }
+}
 
-        Ok(Some(move |children: Result<Vec<Node>, Error>| {
-            node.children = handle_error(children).unwrap_or_default().into();
-            Ok(Some(node))
-        }))
-    };
+fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Error> {
+    let mut nodes = Vec::new();
 
-    scan_tree(path, &handler, args.dereference_all)
+    for entry in add_context(path.read_dir().as_mut(), path)? {
+        let entry = add_context(entry.as_ref(), path)?;
+        let path = entry.path();
+        let metadata = retry_if_interrupted(|| {
+            if args.dereference_all {
+                path.metadata()
+            } else if cfg!(target_vendor = "apple") {
+                path.symlink_metadata()
+            } else {
+                entry.metadata()
+            }
+        });
+        let metadata = add_context(metadata.as_ref(), path.as_path())?;
+        let node = create_node(path, metadata, args);
+        if args.one_file_system && node.device != root.device {
+            continue;
+        }
+        nodes.push(node);
+    }
+
+    nodes
+        .iter_mut()
+        .filter(|node| node.is_dir)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .with_max_len(1)
+        .for_each(|node| {
+            node.children = handle_error(retry_if_interrupted(|| parse_dir(&node.path, args, root)))
+                .unwrap_or_default()
+                .into()
+        });
+
+    Ok(nodes)
 }
 
 fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, Error> {
-    let mut state = FsNodeState::new(
-        path.as_path(),
-        args.dereference_args || args.dereference_all,
-    );
-
-    let mut node = create_node(&mut state, args)?;
+    let metadata = if args.dereference_args || args.dereference_all {
+        path.metadata()
+    } else {
+        path.symlink_metadata()
+    };
+    let metadata = add_context(metadata.as_ref(), path.as_path())?;
+    let mut node = create_node(path, metadata, args);
 
     if node.is_dir {
         node.children = handle_error(parse_dir(&node.path, args, &node))
@@ -158,6 +183,17 @@ fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, Error> {
     }
 
     Ok(node)
+}
+
+#[inline]
+fn add_context<T, E: Borrow<Error>>(result: Result<T, E>, p: &Path) -> io::Result<T> {
+    match result {
+        Ok(x) => Ok(x),
+        Err(e) => {
+            let e = e.borrow();
+            Err(Error::new(e.kind(), format!("{}: {}", p.display(), e)))
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -288,7 +324,7 @@ fn main() -> std::io::Result<()> {
         .files_or_directories
         .par_iter()
         .with_max_len(1)
-        .flat_map_iter(|path| handle_error(parse(path.into(), &args)))
+        .flat_map_iter(|path| handle_error(retry_if_interrupted(|| parse(path.into(), &args))))
         .collect();
 
     let end = Instant::now();
