@@ -4,41 +4,41 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::fs::Metadata;
-use std::io::{self, ErrorKind, Write, stdout};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::result::Result;
 use std::result::Result::Ok;
-use std::thread::available_parallelism;
-use std::time::Instant;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use std::{result, thread};
 
 use clap::{Parser, arg};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 
-type Error = std::io::Error;
-
 #[derive(Debug)]
 struct Node {
-    path: Box<Path>,
+    path: PathBuf,
     is_dir: bool,
     size: u64,
     inode: u64,
     device: u64,
-    children: Box<[Node]>,
+    children: Vec<Node>,
 }
 
 #[derive(Debug)]
 struct FlatNode {
     size: u64,
     is_dir: bool,
-    path: Box<Path>,
+    path: PathBuf,
 }
 
 #[cfg(unix)]
 fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
     use std::os::unix::fs::MetadataExt;
     Node {
-        path: path.into(),
+        path,
         is_dir: metadata.is_dir(),
         size: if args.inodes {
             1
@@ -58,9 +58,9 @@ fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
 }
 
 #[cfg(not(unix))]
-fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Result<Node, Error> {
+fn create_node(path: OwnedPath, metadata: &Metadata, args: &DuArgs) -> Result<Node, Error> {
     Node {
-        path: path.into(),
+        path,
         children: Default::default(),
         is_dir: metadata.is_dir(),
         size: if args.inodes { 1 } else { metadata.len() },
@@ -96,32 +96,18 @@ fn dedupe_inodes(nodes: Vec<Node>, seen: &mut HashSet<(u64, u64)>) -> Vec<Node> 
                 return None;
             }
             Some(Node {
-                children: dedupe_inodes(node.children.into(), seen).into(),
+                children: dedupe_inodes(node.children, seen),
                 ..node
             })
         })
         .collect()
 }
 
-fn total_count(node: &Node) -> usize {
-    1 + node.children.iter().map(total_count).sum::<usize>()
-}
-
-#[inline]
-fn handle_error<T, E: Display>(result: Result<T, E>) -> Option<T> {
-    match result {
-        Ok(v) => return Some(v),
-        Err(e) => eprintln!("{}", e),
-    }
-    return None;
-}
-
-#[inline]
 fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         let result = f();
         if let Err(e) = &result
-            && e.kind() == ErrorKind::Interrupted
+            && e.kind() == io::ErrorKind::Interrupted
         {
             continue;
         }
@@ -129,7 +115,7 @@ fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T
     }
 }
 
-fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Error> {
+fn parse_dir(path: &Path, args: &DuArgs, root: &Node, output: &Output) -> io::Result<Vec<Node>> {
     let mut nodes = Vec::new();
 
     for entry in add_context(path.read_dir().as_mut(), path)? {
@@ -144,7 +130,7 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Error
                 entry.metadata()
             }
         });
-        let metadata = add_context(metadata.as_ref(), path.as_path())?;
+        let metadata = add_context(metadata.as_ref(), &path)?;
         let node = create_node(path, metadata, args);
         if args.one_file_system && node.device != root.device {
             continue;
@@ -159,39 +145,44 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node) -> Result<Vec<Node>, Error
         .into_par_iter()
         .with_max_len(1)
         .for_each(|node| {
-            node.children = handle_error(retry_if_interrupted(|| parse_dir(&node.path, args, root)))
+            node.children = output
+                .handle_error(retry_if_interrupted(|| {
+                    parse_dir(&node.path, args, root, output)
+                }))
                 .unwrap_or_default()
-                .into()
         });
+
+    output.add(nodes.len());
 
     Ok(nodes)
 }
 
-fn parse(path: PathBuf, args: &DuArgs) -> Result<Node, Error> {
+fn parse(path: PathBuf, args: &DuArgs, output: &Output) -> io::Result<Node> {
     let metadata = if args.dereference_args || args.dereference_all {
         path.metadata()
     } else {
         path.symlink_metadata()
     };
-    let metadata = add_context(metadata.as_ref(), path.as_path())?;
+    let metadata = add_context(metadata.as_ref(), &path)?;
     let mut node = create_node(path, metadata, args);
 
     if node.is_dir {
-        node.children = handle_error(parse_dir(&node.path, args, &node))
+        node.children = output
+            .handle_error(parse_dir(&node.path, args, &node, output))
             .unwrap_or_default()
-            .into()
     }
+
+    output.add(1);
 
     Ok(node)
 }
 
-#[inline]
-fn add_context<T, E: Borrow<Error>>(result: Result<T, E>, p: &Path) -> io::Result<T> {
+fn add_context<T, E: Borrow<io::Error>>(result: Result<T, E>, p: &Path) -> io::Result<T> {
     match result {
         Ok(x) => Ok(x),
         Err(e) => {
             let e = e.borrow();
-            Err(Error::new(e.kind(), format!("{}: {}", p.display(), e)))
+            Err(io::Error::new(e.kind(), format!("{}: {}", p.display(), e)))
         }
     }
 }
@@ -302,41 +293,102 @@ struct DuArgs {
     files_or_directories: Vec<String>,
 }
 
-fn default_num_threads() -> usize {
-    available_parallelism()
-        .map(|cores| cores.get() * 2)
-        .unwrap_or(1)
+struct Output {
+    start_time: OnceLock<Instant>,
+    total_count: AtomicUsize,
+    is_done: (Mutex<bool>, Condvar),
+}
+
+impl Output {
+    fn new() -> Self {
+        Output {
+            start_time: OnceLock::new(),
+            total_count: AtomicUsize::new(0),
+            is_done: (Mutex::new(false), Condvar::new()),
+        }
+    }
+
+    fn add(&self, num: usize) {
+        self.total_count.fetch_add(num, Relaxed);
+    }
+
+    fn set_is_done(&self, is_done: bool) {
+        let (mutex, condvar) = &self.is_done;
+        *mutex.lock().unwrap() = is_done;
+        condvar.notify_all();
+    }
+
+    fn handle_error<T, E: Display>(&self, result: result::Result<T, E>) -> Option<T> {
+        match result {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("\r{}", e);
+                self.print_progress();
+                None
+            }
+        }
+    }
+
+    fn print_progress(&self) {
+        let Some(start_time) = self.start_time.get() else {
+            return;
+        };
+        let count = self.total_count.load(Relaxed);
+        let secs = (Instant::now() - *start_time).as_secs_f64();
+        eprint!(
+            "\rScanned {count} nodes in {secs:.3} seconds (avg. {:.0} nodes/s)",
+            count as f64 / secs
+        );
+    }
+}
+
+fn ui_thread(progress: &Output) {
+    let (mutex, condvar) = &progress.is_done;
+    let mut is_done = mutex.lock().unwrap();
+    let mut next_due = Instant::now();
+
+    while !*is_done {
+        (is_done, _) = condvar
+            .wait_timeout(is_done, next_due - Instant::now())
+            .unwrap();
+
+        progress.print_progress();
+        next_due += Duration::from_millis(100);
+    }
+
+    eprint!("\n");
 }
 
 fn main() -> std::io::Result<()> {
     let args: DuArgs = DuArgs::parse();
 
     ThreadPoolBuilder::new()
-        // Include the current thread so with -j1 no threads need to be spawned
-        .use_current_thread()
-        .num_threads(args.num_threads.unwrap_or_else(default_num_threads))
+        .num_threads(args.num_threads.unwrap_or(0))
         .build_global()
         .expect("Failed to set thread pool");
 
-    let start = Instant::now();
+    let output = Output::new();
+    let mut roots: Vec<Node> = thread::scope(|scope| {
+        scope.spawn(|| ui_thread(&output));
 
-    let mut roots: Vec<Node> = args
-        .files_or_directories
-        .par_iter()
-        .with_max_len(1)
-        .flat_map_iter(|path| handle_error(retry_if_interrupted(|| parse(path.into(), &args))))
-        .collect();
+        // Set start time here to exclude thread spawn overheads
+        let _ = output.start_time.set(Instant::now());
 
-    let end = Instant::now();
-    let count: usize = roots.iter().map(total_count).sum();
-    let secs = (end - start).as_secs_f64();
+        let roots = args
+            .files_or_directories
+            .par_iter()
+            .with_max_len(1)
+            .flat_map_iter(|path| {
+                output.handle_error(retry_if_interrupted(|| {
+                    parse(PathBuf::from(path), &args, &output)
+                }))
+            })
+            .collect();
 
-    eprintln!(
-        "Scanned {} nodes in {:.3} seconds ({:.0} nodes/s)",
-        count,
-        secs,
-        count as f64 / secs
-    );
+        output.set_is_done(true);
+
+        roots
+    });
 
     if !args.count_links && cfg!(unix) {
         roots = dedupe_inodes(roots, &mut HashSet::new());
@@ -348,7 +400,7 @@ fn main() -> std::io::Result<()> {
     }
 
     if !args.all {
-        items = items.into_iter().filter(|x| x.is_dir).collect();
+        items.retain(|x| x.is_dir);
     }
 
     if args.reverse {
@@ -361,9 +413,7 @@ fn main() -> std::io::Result<()> {
         items = items.into_iter().take(limit).collect();
     }
 
-    items.shrink_to_fit();
-
-    let output: Box<[Box<str>]> = items
+    let output: Vec<String> = items
         .par_iter()
         .map(|item| {
             let size = if args.inodes {
@@ -378,18 +428,18 @@ fn main() -> std::io::Result<()> {
                 format!("{} blocks", item.size / 512)
             };
 
-            format!("{:>18}  {}\n", size, item.path.display()).into()
+            format!("{:>18}  {}\n", size, item.path.display())
         })
         .collect();
 
     drop(items);
 
-    let mut stdout = stdout().lock();
+    let mut stdout = io::stdout().lock();
     for line in output {
         let result = stdout.write_all(line.as_bytes());
         // Ignore broken pipe from e.g. pipe into less
         match result {
-            Err(e) if e.kind() == ErrorKind::BrokenPipe => break,
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
             x => x?,
         }
     }
