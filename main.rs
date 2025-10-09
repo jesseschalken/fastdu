@@ -131,11 +131,13 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node, output: &Output) -> io::Re
             }
         });
         let metadata = add_context(metadata.as_ref(), &path)?;
-        let node = create_node(path, metadata, args);
-        if args.one_file_system && node.device != root.device {
-            continue;
-        }
-        nodes.push(node);
+        nodes.push(create_node(path, metadata, args));
+    }
+
+    output.add_total(nodes.len());
+
+    if args.one_file_system {
+        nodes.retain(|node| node.device == root.device);
     }
 
     nodes
@@ -151,8 +153,6 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node, output: &Output) -> io::Re
                 }))
                 .unwrap_or_default()
         });
-
-    output.add_total(nodes.len());
 
     Ok(nodes)
 }
