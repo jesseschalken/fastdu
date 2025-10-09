@@ -58,7 +58,7 @@ fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
 }
 
 #[cfg(not(unix))]
-fn create_node(path: OwnedPath, metadata: &Metadata, args: &DuArgs) -> Result<Node, Error> {
+fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
     Node {
         path,
         children: Default::default(),
