@@ -7,9 +7,9 @@ use std::fs::Metadata;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::thread::{available_parallelism, park_timeout};
 use std::time::{Duration, Instant};
 use std::{result, thread};
 
@@ -152,7 +152,7 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node, output: &Output) -> io::Re
                 .unwrap_or_default()
         });
 
-    output.add(nodes.len());
+    output.add_total(nodes.len());
 
     Ok(nodes)
 }
@@ -172,7 +172,7 @@ fn parse(path: PathBuf, args: &DuArgs, output: &Output) -> io::Result<Node> {
             .unwrap_or_default()
     }
 
-    output.add(1);
+    output.add_total(1);
 
     Ok(node)
 }
@@ -293,29 +293,14 @@ struct DuArgs {
     files_or_directories: Vec<String>,
 }
 
-struct Output {
-    start_time: OnceLock<Instant>,
-    total_count: AtomicUsize,
-    is_done: (Mutex<bool>, Condvar),
+struct Output<'a> {
+    ui_thread: &'a thread::Thread,
+    total_count: &'a AtomicUsize,
 }
 
-impl Output {
-    fn new() -> Self {
-        Output {
-            start_time: OnceLock::new(),
-            total_count: AtomicUsize::new(0),
-            is_done: (Mutex::new(false), Condvar::new()),
-        }
-    }
-
-    fn add(&self, num: usize) {
+impl Output<'_> {
+    fn add_total(&self, num: usize) {
         self.total_count.fetch_add(num, Relaxed);
-    }
-
-    fn set_is_done(&self, is_done: bool) {
-        let (mutex, condvar) = &self.is_done;
-        *mutex.lock().unwrap() = is_done;
-        condvar.notify_all();
     }
 
     fn handle_error<T, E: Display>(&self, result: result::Result<T, E>) -> Option<T> {
@@ -323,58 +308,56 @@ impl Output {
             Ok(v) => Some(v),
             Err(e) => {
                 eprintln!("\r{}", e);
-                self.print_progress();
+                self.ui_thread.unpark();
                 None
             }
         }
     }
+}
 
-    fn print_progress(&self) {
-        let Some(start_time) = self.start_time.get() else {
-            return;
-        };
-        let count = self.total_count.load(Relaxed);
-        let secs = (Instant::now() - *start_time).as_secs_f64();
+fn ui_thread(total_count: &AtomicUsize, is_done: &AtomicBool) {
+    let start = Instant::now();
+    let mut next_due = start;
+    while !is_done.load(Relaxed) {
+        park_timeout(next_due - Instant::now());
+        let now = Instant::now();
+        let count = total_count.load(Relaxed);
+        let secs = (now - start).as_secs_f64();
         eprint!(
             "\rScanned {count} nodes in {secs:.3} seconds (avg. {:.0} nodes/s)",
             count as f64 / secs
         );
+        while now > next_due {
+            next_due += Duration::from_millis(1000);
+        }
     }
-}
-
-fn ui_thread(progress: &Output) {
-    let (mutex, condvar) = &progress.is_done;
-    let mut is_done = mutex.lock().unwrap();
-    let mut next_due = Instant::now();
-
-    while !*is_done {
-        (is_done, _) = condvar
-            .wait_timeout(is_done, next_due - Instant::now())
-            .unwrap();
-
-        progress.print_progress();
-        next_due += Duration::from_millis(100);
-    }
-
-    eprint!("\n");
+    eprintln!();
 }
 
 fn main() -> std::io::Result<()> {
     let args: DuArgs = DuArgs::parse();
 
     ThreadPoolBuilder::new()
-        .num_threads(args.num_threads.unwrap_or(0))
+        .num_threads(
+            args.num_threads
+                .or_else(|| available_parallelism().ok().map(|x| x.get() * 2))
+                .unwrap_or(0),
+        )
         .build_global()
         .expect("Failed to set thread pool");
 
-    let output = Output::new();
-    let mut roots: Vec<Node> = thread::scope(|scope| {
-        scope.spawn(|| ui_thread(&output));
+    let total_count = &AtomicUsize::new(0);
+    let is_done = &AtomicBool::new(false);
 
-        // Set start time here to exclude thread spawn overheads
-        let _ = output.start_time.set(Instant::now());
+    let mut roots = thread::scope(|scope| {
+        let ui_thread = scope.spawn(|| ui_thread(total_count, is_done));
 
-        let roots = args
+        let output = Output {
+            ui_thread: ui_thread.thread(),
+            total_count,
+        };
+
+        let roots: Vec<Node> = args
             .files_or_directories
             .par_iter()
             .with_max_len(1)
@@ -385,7 +368,8 @@ fn main() -> std::io::Result<()> {
             })
             .collect();
 
-        output.set_is_done(true);
+        is_done.store(true, Relaxed);
+        ui_thread.thread().unpark();
 
         roots
     });
