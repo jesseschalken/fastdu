@@ -307,7 +307,7 @@ impl Output<'_> {
         match result {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("\r{}", e);
+                eprintln!("{CLEAR_LINE}{e}");
                 self.ui_thread.unpark();
                 None
             }
@@ -324,7 +324,7 @@ fn ui_thread(total_count: &AtomicUsize, is_done: &AtomicBool) {
         let count = total_count.load(Relaxed);
         let secs = (now - start).as_secs_f64();
         eprint!(
-            "\rScanned {count} nodes in {secs:.3} seconds (avg. {:.0} nodes/s)",
+            "{CLEAR_LINE}Scanned {count} nodes in {secs:.3} seconds (avg. {:.0} nodes/s)",
             count as f64 / secs
         );
         while now > next_due {
@@ -333,6 +333,8 @@ fn ui_thread(total_count: &AtomicUsize, is_done: &AtomicBool) {
     }
     eprintln!();
 }
+
+const CLEAR_LINE: &str = "\x1B[2K\r";
 
 fn main() -> std::io::Result<()> {
     let args: DuArgs = DuArgs::parse();
