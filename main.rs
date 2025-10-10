@@ -7,9 +7,11 @@ use std::fs::Metadata;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::thread::{available_parallelism, park_timeout};
+use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
 use std::{result, thread};
 
@@ -294,7 +296,7 @@ struct DuArgs {
 }
 
 struct Output<'a> {
-    ui_thread: &'a thread::Thread,
+    ui_wakeups: Sender<()>,
     total_count: &'a AtomicUsize,
 }
 
@@ -308,18 +310,21 @@ impl Output<'_> {
             Ok(v) => Some(v),
             Err(e) => {
                 eprintln!("{CLEAR_LINE}{e}");
-                self.ui_thread.unpark();
+                let _ = self.ui_wakeups.send(());
                 None
             }
         }
     }
 }
 
-fn ui_thread(total_count: &AtomicUsize, is_done: &AtomicBool) {
+fn ui_thread(total_count: &AtomicUsize, wakups: Receiver<()>) {
     let start = Instant::now();
     let mut next_due = start;
-    while !is_done.load(Relaxed) {
-        park_timeout(next_due - Instant::now());
+    loop {
+        match wakups.recv_timeout(next_due - Instant::now()) {
+            Ok(()) | Err(Timeout) => {}
+            Err(Disconnected) => break,
+        }
         let now = Instant::now();
         let count = total_count.load(Relaxed);
         let secs = (now - start).as_secs_f64();
@@ -349,18 +354,16 @@ fn main() -> std::io::Result<()> {
         .expect("Failed to set thread pool");
 
     let total_count = &AtomicUsize::new(0);
-    let is_done = &AtomicBool::new(false);
 
     let mut roots = thread::scope(|scope| {
-        let ui_thread = scope.spawn(|| ui_thread(total_count, is_done));
-
+        let (sender, receiver) = channel();
         let output = Output {
-            ui_thread: ui_thread.thread(),
+            ui_wakeups: sender,
             total_count,
         };
+        scope.spawn(|| ui_thread(total_count, receiver));
 
-        let roots: Vec<Node> = args
-            .files_or_directories
+        args.files_or_directories
             .par_iter()
             .with_max_len(1)
             .flat_map_iter(|path| {
@@ -368,12 +371,7 @@ fn main() -> std::io::Result<()> {
                     parse(PathBuf::from(path), &args, &output)
                 }))
             })
-            .collect();
-
-        is_done.store(true, Relaxed);
-        ui_thread.thread().unpark();
-
-        roots
+            .collect()
     });
 
     if !args.count_links && cfg!(unix) {
