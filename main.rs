@@ -353,11 +353,13 @@ fn main() -> std::io::Result<()> {
 
     let mut roots = thread::scope(|scope| {
         let (sender, receiver) = channel();
+
+        scope.spawn(|| ui_thread(total_count, receiver));
+
         let output = Output {
             ui_wakeups: sender,
             total_count,
         };
-        scope.spawn(|| ui_thread(total_count, receiver));
 
         args.files_or_directories
             .par_iter()
