@@ -49,12 +49,8 @@ fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
         } else {
             metadata.blocks() * 512
         },
-        inode: if args.count_links { 0 } else { metadata.ino() },
-        device: if args.count_links && !args.one_file_system {
-            0
-        } else {
-            metadata.dev()
-        },
+        inode: metadata.ino(),
+        device: metadata.dev(),
         children: Default::default(),
     }
 }
