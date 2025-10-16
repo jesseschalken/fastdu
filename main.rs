@@ -316,7 +316,8 @@ impl Output<'_> {
 fn ui_thread(total_count: &AtomicUsize, wakups: Receiver<()>) {
     let start = Instant::now();
     let mut next_due = start;
-    'outer: loop {
+    let mut stop = false;
+    loop {
         let count = total_count.load(Relaxed);
         let secs = (Instant::now() - start).as_secs_f64();
         let line = format!(
@@ -324,12 +325,15 @@ fn ui_thread(total_count: &AtomicUsize, wakups: Receiver<()>) {
             count as f64 / secs
         );
         eprint!("{CLEAR_LINE}{line}");
+        if stop {
+            break
+        }
         next_due += Duration::from_millis(1000);
-        loop {
+        while !stop {
             match wakups.recv_timeout(next_due - Instant::now()) {
                 Ok(()) => eprint!("{CLEAR_LINE}{line}"),
                 Err(Timeout) => break,
-                Err(Disconnected) => break 'outer,
+                Err(Disconnected) => stop = true,
             }
         }
     }
