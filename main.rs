@@ -316,20 +316,21 @@ impl Output<'_> {
 fn ui_thread(total_count: &AtomicUsize, wakups: Receiver<()>) {
     let start = Instant::now();
     let mut next_due = start;
-    loop {
-        match wakups.recv_timeout(next_due - Instant::now()) {
-            Ok(()) | Err(Timeout) => {}
-            Err(Disconnected) => break,
-        }
-        let now = Instant::now();
+    'outer: loop {
         let count = total_count.load(Relaxed);
-        let secs = (now - start).as_secs_f64();
-        eprint!(
-            "{CLEAR_LINE}Scanned {count} nodes in {secs:.3} seconds (avg. {:.0} nodes/s)",
+        let secs = (Instant::now() - start).as_secs_f64();
+        let line = format!(
+            "Scanned {count} nodes in {secs:.3} seconds (avg. {:.0} nodes/s)",
             count as f64 / secs
         );
-        while now > next_due {
-            next_due += Duration::from_millis(1000);
+        eprint!("{CLEAR_LINE}{line}");
+        next_due += Duration::from_millis(1000);
+        loop {
+            match wakups.recv_timeout(next_due - Instant::now()) {
+                Ok(()) => eprint!("{CLEAR_LINE}{line}"),
+                Err(Timeout) => break,
+                Err(Disconnected) => break 'outer,
+            }
         }
     }
     eprintln!();
