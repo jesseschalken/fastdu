@@ -86,21 +86,14 @@ fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: Option<&mut FlatNode>
 }
 
 /// to use if -l isn't set
-fn dedupe_inodes(nodes: Vec<Node>, seen: &mut HashSet<(u64, u64)>) -> Vec<Node> {
-    nodes
-        .into_iter()
-        .flat_map(|node| {
-            if !seen.insert((node.device, node.inode)) {
-                return None;
-            }
-            Some(Node {
-                children: dedupe_inodes(node.children, seen),
-                ..node
-            })
-        })
-        .collect()
+fn dedupe_inodes(nodes: &mut Vec<Node>, seen: &mut HashSet<(u64, u64)>) {
+    nodes.retain(|node| seen.insert((node.device, node.inode)));
+    for node in nodes {
+        dedupe_inodes(&mut node.children, seen);
+    }
 }
 
+#[inline(always)]
 fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         let result = f();
@@ -128,6 +121,8 @@ fn parse_dir(
             if args.dereference_all {
                 path.metadata()
             } else if cfg!(target_vendor = "apple") {
+                // On macOS entry.metadata() does entry.path().symlink_metadata()
+                // but in that case we can reuse our existing PathBuf
                 path.symlink_metadata()
             } else {
                 entry.metadata()
@@ -411,7 +406,7 @@ fn main() -> std::io::Result<()> {
     });
 
     if !args.count_links && cfg!(unix) {
-        roots = dedupe_inodes(roots, &mut HashSet::new());
+        dedupe_inodes(&mut roots, &mut HashSet::new());
     }
 
     let mut items = vec![];
