@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::fs::Metadata;
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal, Write as _, stderr};
 use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
 use std::sync::atomic::AtomicUsize;
@@ -113,7 +113,12 @@ fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T
     }
 }
 
-fn parse_dir(path: &Path, args: &DuArgs, root: &Node, output: &Output) -> io::Result<Vec<Node>> {
+fn parse_dir(
+    path: &Path,
+    args: &DuArgs,
+    root: &Node,
+    output: &dyn Output,
+) -> io::Result<Vec<Node>> {
     let mut nodes = Vec::new();
 
     for entry in add_context(path.read_dir().as_mut(), path)? {
@@ -145,17 +150,17 @@ fn parse_dir(path: &Path, args: &DuArgs, root: &Node, output: &Output) -> io::Re
         .into_par_iter()
         .with_max_len(1)
         .for_each(|node| {
-            node.children = output
-                .handle_error(retry_if_interrupted(|| {
-                    parse_dir(&node.path, args, root, output)
-                }))
-                .unwrap_or_default()
+            node.children = handle_error(
+                retry_if_interrupted(|| parse_dir(&node.path, args, root, output)),
+                output,
+            )
+            .unwrap_or_default()
         });
 
     Ok(nodes)
 }
 
-fn parse(path: PathBuf, args: &DuArgs, output: &Output) -> io::Result<Node> {
+fn parse(path: PathBuf, args: &DuArgs, output: &dyn Output) -> io::Result<Node> {
     let metadata = if args.dereference_args || args.dereference_all {
         path.metadata()
     } else {
@@ -165,9 +170,8 @@ fn parse(path: PathBuf, args: &DuArgs, output: &Output) -> io::Result<Node> {
     let mut node = create_node(path, metadata, args);
 
     if node.is_dir {
-        node.children = output
-            .handle_error(parse_dir(&node.path, args, &node, output))
-            .unwrap_or_default()
+        node.children =
+            handle_error(parse_dir(&node.path, args, &node, output), output).unwrap_or_default()
     }
 
     output.add_total(1);
@@ -287,28 +291,53 @@ struct DuArgs {
     )]
     num_threads: Option<usize>,
 
+    #[arg(
+        long = "no-progress",
+        help = "Disable progress output, even if an interactive terminal"
+    )]
+    no_progress: bool,
+
     #[arg(help = "Files or directories to scan")]
     files_or_directories: Vec<String>,
 }
 
-struct Output<'a> {
+trait Output: Sync {
+    fn add_total(&self, num: usize);
+    fn on_error(&self, error: &dyn Display);
+}
+
+struct TerminalOutput<'a> {
     ui_wakeups: Sender<()>,
     total_count: &'a AtomicUsize,
 }
 
-impl Output<'_> {
+impl Output for TerminalOutput<'_> {
     fn add_total(&self, num: usize) {
         self.total_count.fetch_add(num, Relaxed);
     }
 
-    fn handle_error<T, E: Display>(&self, result: result::Result<T, E>) -> Option<T> {
-        match result {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("{CLEAR_LINE}{e}");
-                let _ = self.ui_wakeups.send(());
-                None
-            }
+    fn on_error(&self, error: &dyn Display) {
+        eprintln!("{CLEAR_LINE}{error}");
+        let _ = self.ui_wakeups.send(());
+    }
+}
+
+struct SimpleOutput;
+
+impl Output for SimpleOutput {
+    fn add_total(&self, _num: usize) {}
+
+    fn on_error(&self, error: &dyn Display) {
+        eprintln!("{error}")
+    }
+}
+
+fn handle_error<T, E: Display>(result: result::Result<T, E>, output: &dyn Output) -> Option<T> {
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            output.on_error(&e);
+            None
         }
     }
 }
@@ -317,30 +346,44 @@ fn ui_thread(total_count: &AtomicUsize, wakups: Receiver<()>) {
     let start = Instant::now();
     let mut next_due = start;
     let mut stop = false;
-    loop {
+    let mut status = String::new();
+    while !stop {
+        stop = loop {
+            match wakups.recv_timeout(next_due - Instant::now()) {
+                Ok(()) => eprint!("{CLEAR_LINE}{status}"),
+                Err(Timeout) => break false,
+                Err(Disconnected) => break true,
+            }
+        };
         let count = total_count.load(Relaxed);
         let secs = (Instant::now() - start).as_secs_f64();
-        let line = format!(
+        status = format!(
             "Scanned {count} nodes in {secs:.3} seconds (avg. {:.0} nodes/s)",
             count as f64 / secs
         );
-        eprint!("{CLEAR_LINE}{line}");
-        if stop {
-            break
-        }
+        eprint!("{CLEAR_LINE}{status}");
         next_due += Duration::from_millis(1000);
-        while !stop {
-            match wakups.recv_timeout(next_due - Instant::now()) {
-                Ok(()) => eprint!("{CLEAR_LINE}{line}"),
-                Err(Timeout) => break,
-                Err(Disconnected) => stop = true,
-            }
-        }
     }
     eprintln!();
 }
 
 const CLEAR_LINE: &str = "\x1B[2K\r";
+
+fn with_output<T>(args: &DuArgs, body: impl FnOnce(&dyn Output) -> T) -> T {
+    if args.no_progress || !stderr().is_terminal() {
+        return body(&SimpleOutput);
+    }
+
+    let total_count = &AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let (sender, receiver) = channel();
+        scope.spawn(|| ui_thread(total_count, receiver));
+        body(&TerminalOutput {
+            ui_wakeups: sender,
+            total_count,
+        })
+    })
+}
 
 fn main() -> std::io::Result<()> {
     let args: DuArgs = DuArgs::parse();
@@ -354,25 +397,15 @@ fn main() -> std::io::Result<()> {
         .build_global()
         .expect("Failed to set thread pool");
 
-    let total_count = &AtomicUsize::new(0);
-
-    let mut roots = thread::scope(|scope| {
-        let (sender, receiver) = channel();
-
-        scope.spawn(|| ui_thread(total_count, receiver));
-
-        let output = Output {
-            ui_wakeups: sender,
-            total_count,
-        };
-
+    let mut roots = with_output(&args, |output| {
         args.files_or_directories
             .par_iter()
             .with_max_len(1)
             .flat_map_iter(|path| {
-                output.handle_error(retry_if_interrupted(|| {
-                    parse(PathBuf::from(path), &args, &output)
-                }))
+                handle_error(
+                    retry_if_interrupted(|| parse(PathBuf::from(path), &args, output)),
+                    output,
+                )
             })
             .collect()
     });
