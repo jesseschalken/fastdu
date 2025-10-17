@@ -425,7 +425,7 @@ fn main() -> std::io::Result<()> {
     }
 
     if let Some(limit) = args.limit {
-        items = items.into_iter().take(limit).collect();
+        items.truncate(limit);
     }
 
     let output: Vec<String> = items
