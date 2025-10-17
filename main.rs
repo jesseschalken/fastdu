@@ -32,6 +32,7 @@ struct Node {
 #[derive(Debug)]
 struct FlatNode {
     size: u64,
+    count: usize,
     is_dir: bool,
     path: PathBuf,
 }
@@ -42,9 +43,7 @@ fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
     Node {
         path,
         is_dir: metadata.is_dir(),
-        size: if args.inodes {
-            1
-        } else if args.apparent_size || args.bytes {
+        size: if args.use_apparent_size() {
             metadata.len()
         } else {
             metadata.blocks() * 512
@@ -56,33 +55,35 @@ fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
 }
 
 #[cfg(not(unix))]
-fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
+fn create_node(path: PathBuf, metadata: &Metadata, _args: &DuArgs) -> Node {
     Node {
         path,
         children: Default::default(),
         is_dir: metadata.is_dir(),
-        size: if args.inodes { 1 } else { metadata.len() },
+        size: metadata.len(),
         inode: 0,
         device: 0,
     }
 }
 
-fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: Option<&mut FlatNode>) {
+fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: &mut FlatNode, max_depth: i64) {
     let mut result = FlatNode {
         path: node.path,
         is_dir: node.is_dir,
         size: node.size,
+        count: 1,
     };
 
     for child in node.children {
-        flatten(child, output, Some(&mut result));
+        flatten(child, output, &mut result, max_depth - 1);
     }
 
-    if let Some(parent) = parent {
-        parent.size += result.size;
-    }
+    parent.size += result.size;
+    parent.count += result.count;
 
-    output.push(result);
+    if max_depth >= 0 {
+        output.push(result);
+    }
 }
 
 /// to use if -l isn't set
@@ -190,7 +191,7 @@ struct DuArgs {
     #[arg(
         short = 'A',
         long = "apparent-size",
-        help = "Print apparent sizes rather than device usage"
+        help = "Print apparent sizes rather than device usage. This is always true on Windows."
     )]
     apparent_size: bool,
 
@@ -218,7 +219,7 @@ struct DuArgs {
     #[arg(
         short = 'h',
         long = "human-readable",
-        help = "Print sizes in human readable format (KiB, MiB etc)."
+        help = "Print sizes in human readable format (KiB, MiB etc)"
     )]
     human: bool,
 
@@ -228,14 +229,14 @@ struct DuArgs {
     #[arg(
         short = None,
         long = "si",
-        help = "Like -h, but use powers of 1000 (KB, MB etc) not 1024"
+        help = "Like -h, but use powers of 1000 (KB, MB etc) instead of 1024"
     )]
     si: bool,
 
     #[arg(
         short = None,
         long = "inodes",
-        help = "Count inodes instead of size."
+        help = "Count inodes instead of size"
     )]
     inodes: bool,
 
@@ -288,12 +289,76 @@ struct DuArgs {
 
     #[arg(
         long = "no-progress",
-        help = "Disable progress output, even if an interactive terminal"
+        help = "Disable progress output even if stderr is a terminal"
     )]
     no_progress: bool,
 
     #[arg(help = "Files or directories to scan")]
     files_or_directories: Vec<String>,
+
+    #[arg(
+        long = "du-compatible",
+        help = "Show output in the same format as \"du\". See also --no-progress."
+    )]
+    du_compatible: bool,
+
+    #[arg(
+        short = '0',
+        long = "null",
+        help = "End each line with a null byte instead of newline"
+    )]
+    null: bool,
+
+    #[arg(
+        short = 'd',
+        long = "max-depth",
+        help = "Only show entries up to this maximum depth"
+    )]
+    max_depth: Option<i64>,
+
+    #[arg(short = 's', long = "summarize", help = "Same as --max-depth=0")]
+    summarize: bool,
+
+    #[arg(short = 'c', long = "total", help = "Include a grand total")]
+    show_total: bool,
+}
+
+impl DuArgs {
+    fn output_format(&self) -> OutputFormat {
+        if self.inodes {
+            OutputFormat::Count
+        } else if self.bytes {
+            OutputFormat::Bytes
+        } else if self.si {
+            OutputFormat::SI
+        } else if self.human {
+            OutputFormat::Human
+        } else {
+            OutputFormat::Blocks
+        }
+    }
+
+    fn max_depth(&self) -> i64 {
+        if self.summarize {
+            0
+        } else if let Some(max_depth) = self.max_depth {
+            max_depth
+        } else {
+            i64::MAX
+        }
+    }
+
+    fn use_apparent_size(&self) -> bool {
+        self.apparent_size || self.bytes
+    }
+}
+
+enum OutputFormat {
+    Count,
+    Bytes,
+    Human,
+    SI,
+    Blocks,
 }
 
 trait Output: Sync {
@@ -341,22 +406,22 @@ fn ui_thread(total_count: &AtomicUsize, wakups: Receiver<()>) {
     let start = Instant::now();
     let mut next_due = start;
     let mut stop = false;
-    let mut status = String::new();
+    let mut line = String::new();
     while !stop {
         stop = loop {
             match wakups.recv_timeout(next_due - Instant::now()) {
-                Ok(()) => eprint!("{CLEAR_LINE}{status}"),
+                Ok(()) => eprint!("{CLEAR_LINE}{line}"),
                 Err(Timeout) => break false,
                 Err(Disconnected) => break true,
             }
         };
         let count = total_count.load(Relaxed);
         let secs = (Instant::now() - start).as_secs_f64();
-        status = format!(
+        line = format!(
             "Scanned {count} nodes in {secs:.3} seconds (avg. {:.0} nodes/s)",
             count as f64 / secs
         );
-        eprint!("{CLEAR_LINE}{status}");
+        eprint!("{CLEAR_LINE}{line}");
         next_due += Duration::from_millis(1000);
     }
     eprintln!();
@@ -409,9 +474,20 @@ fn main() -> std::io::Result<()> {
         dedupe_inodes(&mut roots, &mut HashSet::new());
     }
 
+    let mut total = FlatNode {
+        count: 0,
+        is_dir: true,
+        path: "total".into(),
+        size: 0,
+    };
+
     let mut items = vec![];
     for root in roots {
-        flatten(root, &mut items, None);
+        flatten(root, &mut items, &mut total, args.max_depth());
+    }
+
+    if args.show_total {
+        items.push(total);
     }
 
     if !args.all {
@@ -428,29 +504,17 @@ fn main() -> std::io::Result<()> {
         items.truncate(limit);
     }
 
-    let output: Vec<String> = items
-        .par_iter()
-        .map(|item| {
-            let size = if args.inodes {
-                format!("{} inodes", item.size)
-            } else if args.bytes {
-                format!("{} bytes", item.size)
-            } else if args.si {
-                format_bytes(item.size, false)
-            } else if args.human {
-                format_bytes(item.size, true)
-            } else {
-                format!("{} blocks", item.size / 512)
-            };
+    let mut lines = Vec::new();
 
-            format!("{:>18}  {}\n", size, item.path.display())
-        })
-        .collect();
+    items
+        .par_iter()
+        .map(|item| format_line(item, &args))
+        .collect_into_vec(&mut lines);
 
     drop(items);
 
     let mut stdout = io::stdout().lock();
-    for line in output {
+    for line in lines {
         let result = stdout.write_all(line.as_bytes());
         // Ignore broken pipe from e.g. pipe into less
         match result {
@@ -462,24 +526,69 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn format_bytes(bytes: u64, binary: bool) -> String {
-    let kilo = if binary { 1024 } else { 1000 };
+fn format_line(item: &FlatNode, args: &DuArgs) -> String {
+    let format = args.output_format();
+    let newline = if args.null { '\0' } else { '\n' };
+    let count = item.count;
+    let size = item.size;
+    let blocks = size / 512;
 
+    let size_string = if args.du_compatible {
+        match format {
+            OutputFormat::Count => format!("{count}"),
+            OutputFormat::Bytes => format!("{size}"),
+            OutputFormat::Human => format_bytes(size, true, true),
+            OutputFormat::SI => format_bytes(size, false, true),
+            OutputFormat::Blocks => format!("{blocks}"),
+        }
+    } else {
+        match format {
+            OutputFormat::Count => format!("{count} inodes"),
+            OutputFormat::Bytes => format!("{size} bytes"),
+            OutputFormat::Human => format_bytes(size, true, false),
+            OutputFormat::SI => format_bytes(size, false, false),
+            OutputFormat::Blocks => format!("{blocks} blocks"),
+        }
+    };
+
+    if args.du_compatible {
+        format!("{size_string}\t{}{newline}", item.path.display())
+    } else {
+        format!("{size_string:>18}  {}{newline}", item.path.display())
+    }
+}
+
+fn format_bytes(bytes: u64, binary: bool, du_compatible: bool) -> String {
     let mut factor = 1;
     let mut power = 0;
-    while bytes >= (kilo * factor) {
-        factor *= kilo;
+    let mut result = bytes as f64;
+
+    while result >= 1000.0 {
+        factor *= if binary { 1024 } else { 1000 };
         power += 1;
+        result = bytes as f64 / factor as f64;
     }
 
+    let (prefix, suffix) = if binary {
+        (b" KMGTPEZYRQ"[power] as char, "iB")
+    } else {
+        (b" kMGTPEZYRQ"[power] as char, "B")
+    };
+
     match power {
+        0 if du_compatible => format!("{:>3}B", bytes),
+        _ if du_compatible => format!("{:>3}{}", format_float_du_compat(result), prefix),
         0 => format!("{} B", bytes),
-        1 => format!("{} {}", bytes, if binary { "KiB" } else { "kB" }),
-        _ => format!(
-            "{:.3} {}{}",
-            bytes as f64 / factor as f64,
-            b" KMGTPEZYRQ"[power] as char,
-            if binary { "iB" } else { "B" },
-        ),
+        _ => format!("{:.3} {}{}", result, prefix, suffix),
+    }
+}
+
+fn format_float_du_compat(num: f64) -> String {
+    // We have only 3 chars of space, so format with one decimal point if <10
+    let rounded = (num * 10.0).round() / 10.0;
+    if rounded < 10.0 {
+        format!("{:.1}", rounded)
+    } else {
+        format!("{:.0}", num.round())
     }
 }
