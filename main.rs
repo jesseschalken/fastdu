@@ -97,10 +97,10 @@ fn dedupe_inodes(nodes: &mut Vec<Node>, seen: &mut HashSet<(u64, u64)>) {
 fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         let result = f();
-        if let Err(e) = &result
-            && e.kind() == io::ErrorKind::Interrupted
-        {
-            continue;
+        if let Err(e) = &result {
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
         }
         return result;
     }
