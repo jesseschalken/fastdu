@@ -2,7 +2,8 @@ use clap::ArgAction;
 use std::borrow::Borrow;
 use std::cmp::Reverse;
 use std::collections::HashSet;
-use std::fmt::{Debug, Display};
+use std::error::Error;
+use std::fmt::Debug;
 use std::fs::Metadata;
 use std::io::{self, IsTerminal, Write as _, stderr};
 use std::path::{Path, PathBuf};
@@ -11,9 +12,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread;
 use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
-use std::{result, thread};
 
 use clap::{Parser, arg};
 use rayon::ThreadPoolBuilder;
@@ -94,32 +95,20 @@ fn dedupe_inodes(nodes: &mut Vec<Node>, seen: &mut HashSet<(u64, u64)>) {
     }
 }
 
-#[inline(always)]
-fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    loop {
-        let result = f();
-        if let Err(e) = &result {
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-        }
-        return result;
-    }
-}
-
 fn parse_dir(
     path: &Path,
     args: &DuArgs,
     root: &Node,
     output: &dyn Output,
 ) -> io::Result<Vec<Node>> {
-    let mut nodes = Vec::new();
-
-    for entry in add_context(path.read_dir().as_mut(), path)? {
-        let entry = add_context(entry.as_ref(), path)?;
-        let path = entry.path();
-        let metadata = retry_if_interrupted(|| {
-            if args.dereference_all {
+    let mut nodes = path
+        .read_dir()
+        .as_mut()
+        .map_err(add_context(&path))?
+        .map(|entry| -> io::Result<_> {
+            let entry = entry.as_ref().map_err(add_context(&path))?;
+            let path = entry.path();
+            let metadata = if args.dereference_all {
                 path.metadata()
             } else if cfg!(target_vendor = "apple") {
                 // On macOS entry.metadata() does entry.path().symlink_metadata()
@@ -127,11 +116,12 @@ fn parse_dir(
                 path.symlink_metadata()
             } else {
                 entry.metadata()
-            }
-        });
-        let metadata = add_context(metadata.as_ref(), &path)?;
-        nodes.push(create_node(path, metadata, args));
-    }
+            };
+            let metadata = metadata.as_ref().map_err(add_context(&path))?;
+            Ok(create_node(path, metadata, args))
+        })
+        .flat_map(|result| result.inspect_err(|e| output.on_error(e)))
+        .collect::<Vec<_>>();
 
     output.add_total(nodes.len());
 
@@ -146,11 +136,9 @@ fn parse_dir(
         .into_par_iter()
         .with_max_len(1)
         .for_each(|node| {
-            node.children = handle_error(
-                retry_if_interrupted(|| parse_dir(&node.path, args, root, output)),
-                output,
-            )
-            .unwrap_or_default()
+            node.children = parse_dir(&node.path, args, root, output)
+                .inspect_err(|e| output.on_error(e))
+                .unwrap_or_default()
         });
 
     Ok(nodes)
@@ -162,12 +150,11 @@ fn parse(path: PathBuf, args: &DuArgs, output: &dyn Output) -> io::Result<Node> 
     } else {
         path.symlink_metadata()
     };
-    let metadata = add_context(metadata.as_ref(), &path)?;
+    let metadata = metadata.as_ref().map_err(add_context(&path))?;
     let mut node = create_node(path, metadata, args);
 
     if node.is_dir {
-        node.children =
-            handle_error(parse_dir(&node.path, args, &node, output), output).unwrap_or_default()
+        node.children = parse_dir(&node.path, args, &node, output)?
     }
 
     output.add_total(1);
@@ -175,13 +162,10 @@ fn parse(path: PathBuf, args: &DuArgs, output: &dyn Output) -> io::Result<Node> 
     Ok(node)
 }
 
-fn add_context<T, E: Borrow<io::Error>>(result: Result<T, E>, p: &Path) -> io::Result<T> {
-    match result {
-        Ok(x) => Ok(x),
-        Err(e) => {
-            let e = e.borrow();
-            Err(io::Error::new(e.kind(), format!("{}: {}", p.display(), e)))
-        }
+fn add_context<E: Borrow<io::Error>>(path: &Path) -> impl FnOnce(E) -> io::Error {
+    move |error| {
+        let error = error.borrow();
+        io::Error::new(error.kind(), format!("{}: {}", path.display(), error))
     }
 }
 
@@ -363,7 +347,7 @@ enum OutputFormat {
 
 trait Output: Sync {
     fn add_total(&self, num: usize);
-    fn on_error(&self, error: &dyn Display);
+    fn on_error(&self, error: &dyn Error);
 }
 
 struct TerminalOutput<'a> {
@@ -376,7 +360,7 @@ impl Output for TerminalOutput<'_> {
         self.total_count.fetch_add(num, Relaxed);
     }
 
-    fn on_error(&self, error: &dyn Display) {
+    fn on_error(&self, error: &dyn Error) {
         eprintln!("{CLEAR_LINE}{error}");
         let _ = self.ui_wakeups.send(());
     }
@@ -387,18 +371,8 @@ struct SimpleOutput;
 impl Output for SimpleOutput {
     fn add_total(&self, _num: usize) {}
 
-    fn on_error(&self, error: &dyn Display) {
+    fn on_error(&self, error: &dyn Error) {
         eprintln!("{error}")
-    }
-}
-
-fn handle_error<T, E: Display>(result: result::Result<T, E>, output: &dyn Output) -> Option<T> {
-    match result {
-        Ok(v) => Some(v),
-        Err(e) => {
-            output.on_error(&e);
-            None
-        }
     }
 }
 
@@ -462,10 +436,7 @@ fn main() -> std::io::Result<()> {
             .par_iter()
             .with_max_len(1)
             .flat_map_iter(|path| {
-                handle_error(
-                    retry_if_interrupted(|| parse(PathBuf::from(path), &args, output)),
-                    output,
-                )
+                parse(PathBuf::from(path), &args, output).inspect_err(|e| output.on_error(e))
             })
             .collect()
     });
