@@ -543,10 +543,11 @@ fn format_bytes(bytes: u64, binary: bool, du_compatible: bool) -> String {
         result = bytes as f64 / factor as f64;
     }
 
-    let (prefix, suffix) = if binary {
-        (b" KMGTPEZYRQ"[power] as char, "iB")
-    } else {
-        (b" kMGTPEZYRQ"[power] as char, "B")
+    let suffix = if binary { "iB" } else { "B" };
+    let prefix = match power {
+        0 => "",
+        1 if !binary => "k",
+        _ => &"KMGTPEZYRQ"[power - 1..][..1],
     };
 
     match power {
