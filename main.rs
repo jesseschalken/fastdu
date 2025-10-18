@@ -282,7 +282,7 @@ struct DuArgs {
 
     #[arg(
         short = 'j',
-        long = "threads",
+        long = "num-threads",
         help = "Thread count, defaults to 2x the number of CPU cores"
     )]
     num_threads: Option<usize>,
