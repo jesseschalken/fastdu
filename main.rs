@@ -105,9 +105,10 @@ fn parse_dir(
         .read_dir()
         .as_mut()
         .map_err(add_context(&path))?
-        .map(|entry| -> io::Result<_> {
-            let entry = entry.as_ref().map_err(add_context(&path))?;
+        .map(|result| -> io::Result<_> {
+            let entry = result.as_ref().map_err(add_context(&path))?;
             let path = entry.path();
+
             let metadata = if args.dereference_all {
                 path.metadata()
             } else if cfg!(target_vendor = "apple") {
@@ -117,10 +118,12 @@ fn parse_dir(
             } else {
                 entry.metadata()
             };
+
             let metadata = metadata.as_ref().map_err(add_context(&path))?;
+
             Ok(create_node(path, metadata, args))
         })
-        .flat_map(|result| result.inspect_err(|e| output.on_error(e)))
+        .flat_map(|result| result.inspect_err(|e| output.log_error(e)))
         .collect::<Vec<_>>();
 
     output.add_total(nodes.len());
@@ -137,7 +140,7 @@ fn parse_dir(
         .with_max_len(1)
         .for_each(|node| {
             node.children = parse_dir(&node.path, args, root, output)
-                .inspect_err(|e| output.on_error(e))
+                .inspect_err(|e| output.log_error(e))
                 .unwrap_or_default()
         });
 
@@ -347,7 +350,7 @@ enum OutputFormat {
 
 trait Output: Sync {
     fn add_total(&self, num: usize);
-    fn on_error(&self, error: &dyn Error);
+    fn log_error(&self, error: &dyn Error);
 }
 
 struct TerminalOutput<'a> {
@@ -360,7 +363,7 @@ impl Output for TerminalOutput<'_> {
         self.total_count.fetch_add(num, Relaxed);
     }
 
-    fn on_error(&self, error: &dyn Error) {
+    fn log_error(&self, error: &dyn Error) {
         eprintln!("{CLEAR_LINE}{error}");
         let _ = self.ui_wakeups.send(());
     }
@@ -371,7 +374,7 @@ struct SimpleOutput;
 impl Output for SimpleOutput {
     fn add_total(&self, _num: usize) {}
 
-    fn on_error(&self, error: &dyn Error) {
+    fn log_error(&self, error: &dyn Error) {
         eprintln!("{error}")
     }
 }
@@ -436,7 +439,7 @@ fn main() -> std::io::Result<()> {
             .par_iter()
             .with_max_len(1)
             .flat_map_iter(|path| {
-                parse(PathBuf::from(path), &args, output).inspect_err(|e| output.on_error(e))
+                parse(path.into(), &args, output).inspect_err(|e| output.log_error(e))
             })
             .collect()
     });
