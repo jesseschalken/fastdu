@@ -36,6 +36,7 @@ struct FlatNode {
     count: usize,
     is_dir: bool,
     path: PathBuf,
+    depth: usize,
 }
 
 #[cfg(unix)]
@@ -67,24 +68,23 @@ fn create_node(path: PathBuf, metadata: &Metadata, _args: &DuArgs) -> Node {
     }
 }
 
-fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: &mut FlatNode, max_depth: i64) {
+fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: &mut FlatNode, depth: usize) {
     let mut result = FlatNode {
         path: node.path,
         is_dir: node.is_dir,
         size: node.size,
         count: 1,
+        depth,
     };
 
     for child in node.children {
-        flatten(child, output, &mut result, max_depth - 1);
+        flatten(child, output, &mut result, depth + 1);
     }
 
     parent.size += result.size;
     parent.count += result.count;
 
-    if max_depth >= 0 {
-        output.push(result);
-    }
+    output.push(result);
 }
 
 /// to use if -l isn't set
@@ -104,9 +104,9 @@ fn parse_dir(
     let mut nodes = path
         .read_dir()
         .as_mut()
-        .map_err(add_context(&path))?
+        .map_err(add_context(path))?
         .map(|result| -> io::Result<_> {
-            let entry = result.as_ref().map_err(add_context(&path))?;
+            let entry = result.as_ref().map_err(add_context(path))?;
             let path = entry.path();
 
             let metadata = if args.dereference_all {
@@ -301,7 +301,7 @@ struct DuArgs {
         long = "max-depth",
         help = "Only show entries up to this maximum depth"
     )]
-    max_depth: Option<i64>,
+    max_depth: Option<usize>,
 
     #[arg(short = 's', long = "summarize", help = "Same as --max-depth=0")]
     summarize: bool,
@@ -325,13 +325,11 @@ impl DuArgs {
         }
     }
 
-    fn max_depth(&self) -> i64 {
+    fn max_depth(&self) -> Option<usize> {
         if self.summarize {
-            0
-        } else if let Some(max_depth) = self.max_depth {
-            max_depth
+            Some(0)
         } else {
-            i64::MAX
+            self.max_depth
         }
     }
 
@@ -453,11 +451,16 @@ fn main() -> std::io::Result<()> {
         is_dir: true,
         path: "total".into(),
         size: 0,
+        depth: 0,
     };
 
     let mut items = vec![];
     for root in roots {
-        flatten(root, &mut items, &mut total, args.max_depth());
+        flatten(root, &mut items, &mut total, 0);
+    }
+
+    if let Some(max_depth) = args.max_depth() {
+        items.retain(|x| x.depth <= max_depth);
     }
 
     if args.show_total {
