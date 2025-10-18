@@ -559,7 +559,7 @@ fn format_line(item: &FlatNode, args: &DuArgs) -> String {
 }
 
 fn format_bytes(bytes: u64, binary: bool, du_compatible: bool) -> String {
-    let mut factor = 1;
+    let mut factor: u64 = 1;
     let mut power = 0;
     let mut result = bytes as f64;
 
