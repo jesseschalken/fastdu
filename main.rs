@@ -101,6 +101,8 @@ fn parse_dir(
     root: &Node,
     output: &dyn Output,
 ) -> io::Result<Vec<Node>> {
+    // Build nodes before recursing on subdirectories so we close the
+    // directory handle and don't get a "Too many open files" error.
     let mut nodes = path
         .read_dir()
         .as_mut()
