@@ -479,15 +479,15 @@ fn main() -> std::io::Result<()> {
 
     if args.reverse {
         if args.inodes {
-            items.par_sort_by_key(|x| Reverse(x.count));
+            items.par_sort_unstable_by_key(|x| Reverse(x.count));
         } else {
-            items.par_sort_by_key(|x| Reverse(x.size));
+            items.par_sort_unstable_by_key(|x| Reverse(x.size));
         }
     } else if args.sort {
         if args.inodes {
-            items.par_sort_by_key(|x| x.count);
+            items.par_sort_unstable_by_key(|x| x.count);
         } else {
-            items.par_sort_by_key(|x| x.size);
+            items.par_sort_unstable_by_key(|x| x.size);
         }
     }
 
