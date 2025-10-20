@@ -478,9 +478,17 @@ fn main() -> std::io::Result<()> {
     }
 
     if args.reverse {
-        items.par_sort_by_key(|x| Reverse(x.size));
+        if args.inodes {
+            items.par_sort_by_key(|x| Reverse(x.count));
+        } else {
+            items.par_sort_by_key(|x| Reverse(x.size));
+        }
     } else if args.sort {
-        items.par_sort_by_key(|x| x.size);
+        if args.inodes {
+            items.par_sort_by_key(|x| x.count);
+        } else {
+            items.par_sort_by_key(|x| x.size);
+        }
     }
 
     if let Some(limit) = args.limit {
