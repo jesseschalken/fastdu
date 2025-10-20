@@ -12,9 +12,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread;
 use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
+use std::{thread, u64};
 
 use clap::{Parser, arg};
 use rayon::ThreadPoolBuilder;
@@ -93,6 +93,14 @@ fn dedupe_inodes(nodes: &mut Vec<Node>, seen: &mut HashSet<(u64, u64)>) {
     for node in nodes {
         dedupe_inodes(&mut node.children, seen);
     }
+}
+
+fn total_count(nodes: &[Node]) -> usize {
+    let mut total = nodes.len();
+    for node in nodes {
+        total += total_count(&node.children);
+    }
+    total
 }
 
 fn parse_dir(
@@ -438,7 +446,7 @@ fn main() -> std::io::Result<()> {
         .build_global()
         .expect("Failed to set thread pool");
 
-    let mut roots = with_output(&args, |output| {
+    let mut roots: Vec<Node> = with_output(&args, |output| {
         args.files_or_directories
             .par_iter()
             .with_max_len(1)
@@ -448,8 +456,10 @@ fn main() -> std::io::Result<()> {
             .collect()
     });
 
+    let mut count = total_count(&roots);
+
     if !args.count_links && cfg!(unix) {
-        dedupe_inodes(&mut roots, &mut HashSet::new());
+        dedupe_inodes(&mut roots, &mut HashSet::with_capacity(count));
     }
 
     let mut total = FlatNode {
@@ -460,7 +470,12 @@ fn main() -> std::io::Result<()> {
         depth: 0,
     };
 
-    let mut items = vec![];
+    if args.show_total {
+        count += 1;
+    }
+
+    let mut items = Vec::with_capacity(count);
+
     for root in roots {
         flatten(root, &mut items, &mut total, 0);
     }
@@ -495,7 +510,7 @@ fn main() -> std::io::Result<()> {
         items.truncate(limit);
     }
 
-    let mut lines = Vec::new();
+    let mut lines = Vec::with_capacity(items.len());
 
     items
         .par_iter()
