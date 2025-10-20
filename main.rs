@@ -199,7 +199,11 @@ struct DuArgs {
     )]
     dereference_all: bool,
 
-    #[arg(short = 'b', long = "bytes", help = "Print size in bytes")]
+    #[arg(
+        short = 'b',
+        long = "bytes",
+        help = "Print size in bytes. Implies --apparent-size unles --blocks is also passed."
+    )]
     bytes: bool,
 
     #[arg(short = None, long = "blocks", help = "Print size in 512 byte blocks. This is the default.")]
@@ -336,7 +340,7 @@ impl DuArgs {
     }
 
     fn use_apparent_size(&self) -> bool {
-        self.apparent_size || self.bytes
+        self.apparent_size || (self.bytes && !self.blocks)
     }
 }
 
