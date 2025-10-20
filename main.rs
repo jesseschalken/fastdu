@@ -513,11 +513,9 @@ fn main() -> std::io::Result<()> {
     let mut lines = Vec::with_capacity(items.len());
 
     items
-        .par_iter()
-        .map(|item| format_line(item, &args))
+        .into_par_iter()
+        .map(|item| format_line(&item, &args))
         .collect_into_vec(&mut lines);
-
-    drop(items);
 
     let mut stdout = io::stdout().lock();
     for line in lines {
