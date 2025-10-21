@@ -111,8 +111,9 @@ fn parse_dir(
 ) -> io::Result<Vec<Node>> {
     // Build nodes before recursing on subdirectories so we close the
     // directory handle and don't get a "Too many open files" error.
-    let mut nodes = path
-        .read_dir()
+
+    // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
+    let mut nodes = retry_if_interrupted(|| path.read_dir())
         .as_mut()
         .map_err(add_context(path))?
         .map(|result| -> io::Result<_> {
@@ -432,6 +433,16 @@ fn with_output<T>(args: &DuArgs, body: impl FnOnce(&dyn Output) -> T) -> T {
             total_count,
         })
     })
+}
+
+fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        let result = f();
+        match &result {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            _ => return result,
+        }
+    }
 }
 
 fn main() -> std::io::Result<()> {
