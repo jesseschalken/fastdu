@@ -1,8 +1,8 @@
 use clap::ArgAction;
-use std::borrow::Borrow;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
 use std::fs::Metadata;
 use std::io::{self, IsTerminal, Write as _, stderr};
@@ -16,18 +16,18 @@ use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
 use std::{thread, u64};
 
-use clap::{Parser, arg};
+use clap::Parser;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 
 #[derive(Debug)]
 struct Node {
-    path: PathBuf,
+    name: Box<OsStr>,
     is_dir: bool,
     size: u64,
     inode: u64,
     device: u64,
-    children: Vec<Node>,
+    children: Box<[Node]>,
 }
 
 #[derive(Debug)]
@@ -35,15 +35,15 @@ struct FlatNode {
     size: u64,
     count: usize,
     is_dir: bool,
-    path: PathBuf,
+    path: Box<Path>,
     depth: usize,
 }
 
 #[cfg(unix)]
-fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
+fn create_node(name: Box<OsStr>, metadata: &Metadata, args: &DuArgs) -> Node {
     use std::os::unix::fs::MetadataExt;
     Node {
-        path,
+        name,
         is_dir: metadata.is_dir(),
         size: if args.use_apparent_size() {
             metadata.len()
@@ -57,9 +57,9 @@ fn create_node(path: PathBuf, metadata: &Metadata, args: &DuArgs) -> Node {
 }
 
 #[cfg(not(unix))]
-fn create_node(path: PathBuf, metadata: &Metadata, _args: &DuArgs) -> Node {
+fn create_node(name: Box<OsStr>, metadata: &Metadata, _args: &DuArgs) -> Node {
     Node {
-        path,
+        name,
         children: Default::default(),
         is_dir: metadata.is_dir(),
         size: metadata.len(),
@@ -68,9 +68,20 @@ fn create_node(path: PathBuf, metadata: &Metadata, _args: &DuArgs) -> Node {
     }
 }
 
+fn fast_join(path: &Path, name: &OsStr) -> Box<Path> {
+    // Assume the result will be {path}/{name} so that in most
+    // cases .into_boxed_path() doesn't reallocate.
+    let mut result = OsString::with_capacity(path.as_os_str().len() + 1 + name.len());
+    // Push first onto an OsString to skip the PathBuf::push logic.
+    result.push(path);
+    let mut result = PathBuf::from(result);
+    result.push(name);
+    result.into_boxed_path()
+}
+
 fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: &mut FlatNode, depth: usize) {
     let mut result = FlatNode {
-        path: node.path,
+        path: fast_join(&parent.path, &node.name),
         is_dir: node.is_dir,
         size: node.size,
         count: 1,
@@ -88,11 +99,18 @@ fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: &mut FlatNode, depth:
 }
 
 /// to use if -l isn't set
-fn dedupe_inodes(nodes: &mut Vec<Node>, seen: &mut HashSet<(u64, u64)>) {
-    nodes.retain(|node| seen.insert((node.device, node.inode)));
-    for node in nodes {
-        dedupe_inodes(&mut node.children, seen);
-    }
+fn dedupe_inodes(nodes: Box<[Node]>, seen: &mut HashSet<(u64, u64)>) -> Box<[Node]> {
+    nodes
+        .into_iter()
+        .flat_map(|mut node| {
+            if seen.insert((node.device, node.inode)) {
+                node.children = dedupe_inodes(node.children, seen);
+                Some(node)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn total_count(nodes: &[Node]) -> usize {
@@ -108,40 +126,48 @@ fn parse_dir(
     args: &DuArgs,
     root: &Node,
     output: &dyn Output,
-) -> io::Result<Vec<Node>> {
+) -> io::Result<Box<[Node]>> {
     // Build nodes before recursing on subdirectories so we close the
     // directory handle and don't get a "Too many open files" error.
 
     // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
     let mut nodes = retry_if_interrupted(|| path.read_dir())
         .as_mut()
-        .map_err(add_context(path))?
+        .map_err(|e| add_context(e, path))?
         .map(|result| -> io::Result<_> {
-            let entry = result.as_ref().map_err(add_context(path))?;
-            let path = entry.path();
+            let entry = result.as_ref().map_err(|e| add_context(e, path))?;
 
             let metadata = if args.dereference_all {
-                path.metadata()
-            } else if cfg!(target_vendor = "apple") {
-                // On macOS entry.metadata() does entry.path().symlink_metadata()
-                // but in that case we can reuse our existing PathBuf
-                path.symlink_metadata()
+                entry.path().metadata()
             } else {
                 entry.metadata()
             };
 
-            let metadata = metadata.as_ref().map_err(add_context(&path))?;
+            let metadata = metadata
+                .as_ref()
+                .map_err(|e| add_context(e, &entry.path()))?;
 
-            Ok(create_node(path, metadata, args))
+            let name = entry.file_name();
+
+            assert_eq!(
+                name.len(),
+                name.capacity(),
+                "DirEntry::file_name allocated extra capacity"
+            );
+
+            let node = create_node(name.into(), metadata, args);
+
+            if args.one_file_system && node.device != root.device {
+                return Ok(None);
+            }
+
+            Ok(Some(node))
         })
         .flat_map(|result| result.inspect_err(|e| output.log_error(e)))
-        .collect::<Vec<_>>();
+        .flatten()
+        .collect::<Box<_>>();
 
     output.add_total(nodes.len());
-
-    if args.one_file_system {
-        nodes.retain(|node| node.device == root.device);
-    }
 
     nodes
         .iter_mut()
@@ -150,7 +176,7 @@ fn parse_dir(
         .into_par_iter()
         .with_max_len(1)
         .for_each(|node| {
-            node.children = parse_dir(&node.path, args, root, output)
+            node.children = parse_dir(&fast_join(path, &node.name), args, root, output)
                 .inspect_err(|e| output.log_error(e))
                 .unwrap_or_default()
         });
@@ -164,11 +190,11 @@ fn parse(path: PathBuf, args: &DuArgs, output: &dyn Output) -> io::Result<Node> 
     } else {
         path.symlink_metadata()
     };
-    let metadata = metadata.as_ref().map_err(add_context(&path))?;
-    let mut node = create_node(path, metadata, args);
+    let metadata = metadata.as_ref().map_err(|e| add_context(e, &path))?;
+    let mut node = create_node(OsString::from(path).into(), metadata, args);
 
     if node.is_dir {
-        node.children = parse_dir(&node.path, args, &node, output)?
+        node.children = parse_dir(Path::new(&node.name), args, &node, output)?
     }
 
     output.add_total(1);
@@ -176,11 +202,8 @@ fn parse(path: PathBuf, args: &DuArgs, output: &dyn Output) -> io::Result<Node> 
     Ok(node)
 }
 
-fn add_context<E: Borrow<io::Error>>(path: &Path) -> impl FnOnce(E) -> io::Error {
-    move |error| {
-        let error = error.borrow();
-        io::Error::new(error.kind(), format!("{}: {}", path.display(), error))
-    }
+fn add_context(error: &io::Error, path: &Path) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {}", path.display(), error))
 }
 
 #[derive(Parser)]
@@ -457,7 +480,7 @@ fn main() -> std::io::Result<()> {
         .build_global()
         .expect("Failed to set thread pool");
 
-    let mut roots: Vec<Node> = with_output(&args, |output| {
+    let mut roots: Box<[Node]> = with_output(&args, |output| {
         args.files_or_directories
             .par_iter()
             .with_max_len(1)
@@ -470,13 +493,13 @@ fn main() -> std::io::Result<()> {
     let mut count = total_count(&roots);
 
     if !args.count_links && cfg!(unix) {
-        dedupe_inodes(&mut roots, &mut HashSet::with_capacity(count));
+        roots = dedupe_inodes(roots, &mut HashSet::with_capacity(count));
     }
 
     let mut total = FlatNode {
         count: 0,
         is_dir: true,
-        path: "total".into(),
+        path: PathBuf::new().into(),
         size: 0,
         depth: 0,
     };
@@ -496,6 +519,7 @@ fn main() -> std::io::Result<()> {
     }
 
     if args.show_total {
+        total.path = PathBuf::from("total").into();
         items.push(total);
     }
 
