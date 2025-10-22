@@ -69,7 +69,19 @@ impl Node {
         }
     }
 
-    fn flatten(self, output: &mut Vec<FlatNode>, parent: &mut FlatNode, depth: usize) {
+    fn flatten(
+        self,
+        output: &mut Vec<FlatNode>,
+        parent: &mut FlatNode,
+        seen: &mut Option<HashSet<(u64, u64)>>,
+        depth: usize,
+    ) {
+        if let Some(seen) = seen {
+            if !seen.insert((self.device, self.inode)) {
+                return;
+            }
+        }
+
         let mut result = FlatNode {
             path: fast_path_join(&parent.path, &self.name),
             is_dir: self.is_dir,
@@ -79,27 +91,13 @@ impl Node {
         };
 
         for child in self.children {
-            child.flatten(output, &mut result, depth + 1);
+            child.flatten(output, &mut result, seen, depth + 1);
         }
 
         parent.size += result.size;
         parent.count += result.count;
 
         output.push(result);
-    }
-
-    /// to use if -l isn't set
-    fn dedupe_inodes(mut self, seen: &mut HashSet<(u64, u64)>) -> Option<Self> {
-        if seen.insert((self.device, self.inode)) {
-            self.children = self
-                .children
-                .into_iter()
-                .flat_map(|node| node.dedupe_inodes(seen))
-                .collect();
-            Some(self)
-        } else {
-            None
-        }
     }
 
     fn total_count(&self) -> usize {
@@ -482,7 +480,7 @@ fn main() -> std::io::Result<()> {
         .build_global()
         .expect("Failed to set thread pool");
 
-    let mut roots: Box<[Node]> = args.with_output(|output| {
+    let roots: Vec<Node> = args.with_output(|output| {
         args.files_or_directories
             .par_iter()
             .with_max_len(1)
@@ -493,14 +491,6 @@ fn main() -> std::io::Result<()> {
     });
 
     let mut count = roots.iter().map(Node::total_count).sum();
-
-    if !args.count_links && cfg!(unix) {
-        let seen = &mut HashSet::with_capacity(count);
-        roots = roots
-            .into_iter()
-            .flat_map(|node| node.dedupe_inodes(seen))
-            .collect();
-    }
 
     let mut total = FlatNode {
         count: 0,
@@ -516,8 +506,14 @@ fn main() -> std::io::Result<()> {
 
     let mut items = Vec::with_capacity(count);
 
+    let mut seen = if !args.count_links && cfg!(unix) {
+        Some(HashSet::with_capacity(count))
+    } else {
+        None
+    };
+
     for root in roots {
-        root.flatten(&mut items, &mut total, 0);
+        root.flatten(&mut items, &mut total, &mut seen, 0);
     }
 
     if let Some(max_depth) = args.max_depth() {
