@@ -1,4 +1,5 @@
 use clap::ArgAction;
+use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::error::Error;
@@ -73,7 +74,7 @@ impl Node {
         self,
         output: &mut Vec<FlatNode>,
         parent: &mut FlatNode,
-        seen: &mut Option<HashSet<(u64, u64)>>,
+        seen: &mut Option<FxHashSet<(u64, u64)>>,
         depth: usize,
     ) {
         if let Some(seen) = seen {
@@ -507,7 +508,10 @@ fn main() -> std::io::Result<()> {
     let mut items = Vec::with_capacity(count);
 
     let mut seen = if !args.count_links && cfg!(unix) {
-        Some(HashSet::with_capacity(count))
+        Some(HashSet::with_capacity_and_hasher(
+            count,
+            FxBuildHasher::default(),
+        ))
     } else {
         None
     };
