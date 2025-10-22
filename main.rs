@@ -39,36 +39,161 @@ struct FlatNode {
     depth: usize,
 }
 
-#[cfg(unix)]
-fn create_node(name: Box<OsStr>, metadata: &Metadata, args: &DuArgs) -> Node {
-    use std::os::unix::fs::MetadataExt;
-    Node {
-        name,
-        is_dir: metadata.is_dir(),
-        size: if args.use_apparent_size() {
-            metadata.len()
+impl Node {
+    #[cfg(unix)]
+    fn new(name: Box<OsStr>, metadata: &Metadata, args: &DuArgs) -> Node {
+        use std::os::unix::fs::MetadataExt;
+        Node {
+            name,
+            is_dir: metadata.is_dir(),
+            size: if args.use_apparent_size() {
+                metadata.len()
+            } else {
+                metadata.blocks() * 512
+            },
+            inode: metadata.ino(),
+            device: metadata.dev(),
+            children: Default::default(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn new(name: Box<OsStr>, metadata: &Metadata, _args: &DuArgs) -> Node {
+        Node {
+            name,
+            children: Default::default(),
+            is_dir: metadata.is_dir(),
+            size: metadata.len(),
+            inode: 0,
+            device: 0,
+        }
+    }
+
+    fn flatten(self, output: &mut Vec<FlatNode>, parent: &mut FlatNode, depth: usize) {
+        let mut result = FlatNode {
+            path: fast_path_join(&parent.path, &self.name),
+            is_dir: self.is_dir,
+            size: self.size,
+            count: 1,
+            depth,
+        };
+
+        for child in self.children {
+            child.flatten(output, &mut result, depth + 1);
+        }
+
+        parent.size += result.size;
+        parent.count += result.count;
+
+        output.push(result);
+    }
+
+    /// to use if -l isn't set
+    fn dedupe_inodes(mut self, seen: &mut HashSet<(u64, u64)>) -> Option<Self> {
+        if seen.insert((self.device, self.inode)) {
+            self.children = self
+                .children
+                .into_iter()
+                .flat_map(|node| node.dedupe_inodes(seen))
+                .collect();
+            Some(self)
         } else {
-            metadata.blocks() * 512
-        },
-        inode: metadata.ino(),
-        device: metadata.dev(),
-        children: Default::default(),
+            None
+        }
+    }
+
+    fn total_count(&self) -> usize {
+        let mut total = 1;
+        for node in &self.children {
+            total += node.total_count();
+        }
+        total
+    }
+
+    fn read_children(
+        path: &Path,
+        args: &DuArgs,
+        root: &Node,
+        output: &dyn Output,
+    ) -> io::Result<Box<[Node]>> {
+        // Build nodes before recursing on subdirectories so we close the
+        // directory handle and don't get a "Too many open files" error.
+
+        // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
+        let mut nodes = retry_if_interrupted(|| path.read_dir())
+            .as_mut()
+            .map_err(|e| add_context(e, path))?
+            .map(|result| -> io::Result<_> {
+                let entry = result.as_ref().map_err(|e| add_context(e, path))?;
+
+                let metadata = if args.dereference_all {
+                    entry.path().metadata()
+                } else {
+                    entry.metadata()
+                };
+
+                let metadata = metadata
+                    .as_ref()
+                    .map_err(|e| add_context(e, &entry.path()))?;
+
+                let name = entry.file_name();
+
+                assert_eq!(
+                    name.len(),
+                    name.capacity(),
+                    "DirEntry::file_name allocated extra capacity"
+                );
+
+                let node = Node::new(name.into(), metadata, args);
+
+                if args.one_file_system && node.device != root.device {
+                    return Ok(None);
+                }
+
+                Ok(Some(node))
+            })
+            .flat_map(|result| result.inspect_err(|e| output.log_error(e)))
+            .flatten()
+            .collect::<Box<_>>();
+
+        output.add_total(nodes.len());
+
+        nodes
+            .iter_mut()
+            .filter(|node| node.is_dir)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .with_max_len(1)
+            .for_each(|node| {
+                node.children =
+                    Node::read_children(&fast_path_join(path, &node.name), args, root, output)
+                        .inspect_err(|e| output.log_error(e))
+                        .unwrap_or_default()
+            });
+
+        Ok(nodes)
+    }
+
+    fn read(path: PathBuf, args: &DuArgs, output: &dyn Output) -> io::Result<Node> {
+        let metadata = if args.dereference_args || args.dereference_all {
+            path.metadata()
+        } else {
+            path.symlink_metadata()
+        };
+        let metadata = metadata.as_ref().map_err(|e| add_context(e, &path))?;
+        let mut node = Node::new(OsString::from(path).into(), metadata, args);
+
+        if node.is_dir {
+            node.children = Node::read_children(Path::new(&node.name), args, &node, output)?
+        }
+
+        output.add_total(1);
+
+        Ok(node)
     }
 }
 
-#[cfg(not(unix))]
-fn create_node(name: Box<OsStr>, metadata: &Metadata, _args: &DuArgs) -> Node {
-    Node {
-        name,
-        children: Default::default(),
-        is_dir: metadata.is_dir(),
-        size: metadata.len(),
-        inode: 0,
-        device: 0,
-    }
-}
-
-fn fast_join(path: &Path, name: &OsStr) -> Box<Path> {
+fn fast_path_join(path: &Path, name: &OsStr) -> Box<Path> {
     // Assume the result will be {path}/{name} so that in most
     // cases .into_boxed_path() doesn't reallocate.
     let mut result = OsString::with_capacity(path.as_os_str().len() + 1 + name.len());
@@ -77,129 +202,6 @@ fn fast_join(path: &Path, name: &OsStr) -> Box<Path> {
     let mut result = PathBuf::from(result);
     result.push(name);
     result.into_boxed_path()
-}
-
-fn flatten(node: Node, output: &mut Vec<FlatNode>, parent: &mut FlatNode, depth: usize) {
-    let mut result = FlatNode {
-        path: fast_join(&parent.path, &node.name),
-        is_dir: node.is_dir,
-        size: node.size,
-        count: 1,
-        depth,
-    };
-
-    for child in node.children {
-        flatten(child, output, &mut result, depth + 1);
-    }
-
-    parent.size += result.size;
-    parent.count += result.count;
-
-    output.push(result);
-}
-
-/// to use if -l isn't set
-fn dedupe_inodes(nodes: Box<[Node]>, seen: &mut HashSet<(u64, u64)>) -> Box<[Node]> {
-    nodes
-        .into_iter()
-        .flat_map(|mut node| {
-            if seen.insert((node.device, node.inode)) {
-                node.children = dedupe_inodes(node.children, seen);
-                Some(node)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn total_count(nodes: &[Node]) -> usize {
-    let mut total = nodes.len();
-    for node in nodes {
-        total += total_count(&node.children);
-    }
-    total
-}
-
-fn parse_dir(
-    path: &Path,
-    args: &DuArgs,
-    root: &Node,
-    output: &dyn Output,
-) -> io::Result<Box<[Node]>> {
-    // Build nodes before recursing on subdirectories so we close the
-    // directory handle and don't get a "Too many open files" error.
-
-    // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
-    let mut nodes = retry_if_interrupted(|| path.read_dir())
-        .as_mut()
-        .map_err(|e| add_context(e, path))?
-        .map(|result| -> io::Result<_> {
-            let entry = result.as_ref().map_err(|e| add_context(e, path))?;
-
-            let metadata = if args.dereference_all {
-                entry.path().metadata()
-            } else {
-                entry.metadata()
-            };
-
-            let metadata = metadata
-                .as_ref()
-                .map_err(|e| add_context(e, &entry.path()))?;
-
-            let name = entry.file_name();
-
-            assert_eq!(
-                name.len(),
-                name.capacity(),
-                "DirEntry::file_name allocated extra capacity"
-            );
-
-            let node = create_node(name.into(), metadata, args);
-
-            if args.one_file_system && node.device != root.device {
-                return Ok(None);
-            }
-
-            Ok(Some(node))
-        })
-        .flat_map(|result| result.inspect_err(|e| output.log_error(e)))
-        .flatten()
-        .collect::<Box<_>>();
-
-    output.add_total(nodes.len());
-
-    nodes
-        .iter_mut()
-        .filter(|node| node.is_dir)
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .with_max_len(1)
-        .for_each(|node| {
-            node.children = parse_dir(&fast_join(path, &node.name), args, root, output)
-                .inspect_err(|e| output.log_error(e))
-                .unwrap_or_default()
-        });
-
-    Ok(nodes)
-}
-
-fn parse(path: PathBuf, args: &DuArgs, output: &dyn Output) -> io::Result<Node> {
-    let metadata = if args.dereference_args || args.dereference_all {
-        path.metadata()
-    } else {
-        path.symlink_metadata()
-    };
-    let metadata = metadata.as_ref().map_err(|e| add_context(e, &path))?;
-    let mut node = create_node(OsString::from(path).into(), metadata, args);
-
-    if node.is_dir {
-        node.children = parse_dir(Path::new(&node.name), args, &node, output)?
-    }
-
-    output.add_total(1);
-
-    Ok(node)
 }
 
 fn add_context(error: &io::Error, path: &Path) -> io::Error {
@@ -374,6 +376,22 @@ impl DuArgs {
     fn use_apparent_size(&self) -> bool {
         self.apparent_size || (self.bytes && !self.blocks)
     }
+
+    fn with_output<T>(&self, body: impl FnOnce(&dyn Output) -> T) -> T {
+        if self.no_progress || !stderr().is_terminal() {
+            return body(&SimpleOutput);
+        }
+
+        let total_count = &AtomicUsize::new(0);
+        thread::scope(|scope| {
+            let (sender, receiver) = channel();
+            scope.spawn(|| ui_thread(total_count, receiver));
+            body(&TerminalOutput {
+                ui_wakeups: sender,
+                total_count,
+            })
+        })
+    }
 }
 
 enum OutputFormat {
@@ -442,22 +460,6 @@ fn ui_thread(total_count: &AtomicUsize, wakups: Receiver<()>) {
 
 const CLEAR_LINE: &str = "\x1B[2K\r";
 
-fn with_output<T>(args: &DuArgs, body: impl FnOnce(&dyn Output) -> T) -> T {
-    if args.no_progress || !stderr().is_terminal() {
-        return body(&SimpleOutput);
-    }
-
-    let total_count = &AtomicUsize::new(0);
-    thread::scope(|scope| {
-        let (sender, receiver) = channel();
-        scope.spawn(|| ui_thread(total_count, receiver));
-        body(&TerminalOutput {
-            ui_wakeups: sender,
-            total_count,
-        })
-    })
-}
-
 fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         let result = f();
@@ -480,20 +482,24 @@ fn main() -> std::io::Result<()> {
         .build_global()
         .expect("Failed to set thread pool");
 
-    let mut roots: Box<[Node]> = with_output(&args, |output| {
+    let mut roots: Box<[Node]> = args.with_output(|output| {
         args.files_or_directories
             .par_iter()
             .with_max_len(1)
             .flat_map_iter(|path| {
-                parse(path.into(), &args, output).inspect_err(|e| output.log_error(e))
+                Node::read(path.into(), &args, output).inspect_err(|e| output.log_error(e))
             })
             .collect()
     });
 
-    let mut count = total_count(&roots);
+    let mut count = roots.iter().map(Node::total_count).sum();
 
     if !args.count_links && cfg!(unix) {
-        roots = dedupe_inodes(roots, &mut HashSet::with_capacity(count));
+        let seen = &mut HashSet::with_capacity(count);
+        roots = roots
+            .into_iter()
+            .flat_map(|node| node.dedupe_inodes(seen))
+            .collect();
     }
 
     let mut total = FlatNode {
@@ -511,7 +517,7 @@ fn main() -> std::io::Result<()> {
     let mut items = Vec::with_capacity(count);
 
     for root in roots {
-        flatten(root, &mut items, &mut total, 0);
+        root.flatten(&mut items, &mut total, 0);
     }
 
     if let Some(max_depth) = args.max_depth() {
@@ -549,7 +555,7 @@ fn main() -> std::io::Result<()> {
 
     items
         .into_par_iter()
-        .map(|item| format_line(&item, &args))
+        .map(|item| item.format_line(&args))
         .collect_into_vec(&mut lines);
 
     let mut stdout = io::stdout().lock();
@@ -565,35 +571,37 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn format_line(item: &FlatNode, args: &DuArgs) -> String {
-    let format = args.output_format();
-    let newline = if args.null { '\0' } else { '\n' };
-    let count = item.count;
-    let size = item.size;
-    let blocks = size / 512;
+impl FlatNode {
+    fn format_line(&self, args: &DuArgs) -> String {
+        let format = args.output_format();
+        let newline = if args.null { '\0' } else { '\n' };
+        let count = self.count;
+        let size = self.size;
+        let blocks = size / 512;
 
-    let size_string = if args.du_compatible {
-        match format {
-            OutputFormat::Count => format!("{count}"),
-            OutputFormat::Bytes => format!("{size}"),
-            OutputFormat::Human => format_bytes(size, true, true),
-            OutputFormat::SI => format_bytes(size, false, true),
-            OutputFormat::Blocks => format!("{blocks}"),
-        }
-    } else {
-        match format {
-            OutputFormat::Count => format!("{count} inodes"),
-            OutputFormat::Bytes => format!("{size} bytes"),
-            OutputFormat::Human => format_bytes(size, true, false),
-            OutputFormat::SI => format_bytes(size, false, false),
-            OutputFormat::Blocks => format!("{blocks} blocks"),
-        }
-    };
+        let size_string = if args.du_compatible {
+            match format {
+                OutputFormat::Count => format!("{count}"),
+                OutputFormat::Bytes => format!("{size}"),
+                OutputFormat::Human => format_bytes(size, true, true),
+                OutputFormat::SI => format_bytes(size, false, true),
+                OutputFormat::Blocks => format!("{blocks}"),
+            }
+        } else {
+            match format {
+                OutputFormat::Count => format!("{count} inodes"),
+                OutputFormat::Bytes => format!("{size} bytes"),
+                OutputFormat::Human => format_bytes(size, true, false),
+                OutputFormat::SI => format_bytes(size, false, false),
+                OutputFormat::Blocks => format!("{blocks} blocks"),
+            }
+        };
 
-    if args.du_compatible {
-        format!("{size_string}\t{}{newline}", item.path.display())
-    } else {
-        format!("{size_string:>18}  {}{newline}", item.path.display())
+        if args.du_compatible {
+            format!("{size_string}\t{}{newline}", self.path.display())
+        } else {
+            format!("{size_string:>18}  {}{newline}", self.path.display())
+        }
     }
 }
 
