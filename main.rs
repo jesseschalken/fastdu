@@ -35,9 +35,7 @@ struct Node {
 struct FlatNode {
     size: u64,
     count: usize,
-    is_dir: bool,
     path: Box<Path>,
-    depth: usize,
 }
 
 impl Node {
@@ -71,11 +69,12 @@ impl Node {
     }
 
     fn flatten(
-        self,
+        &self,
         output: &mut Vec<FlatNode>,
         parent: &mut FlatNode,
         seen: &mut Option<FxHashSet<(u64, u64)>>,
-        depth: usize,
+        all: bool,
+        max_depth: isize,
     ) {
         if let Some(seen) = seen {
             if !seen.insert((self.device, self.inode)) {
@@ -83,22 +82,30 @@ impl Node {
             }
         }
 
-        let mut result = FlatNode {
-            path: fast_path_join(&parent.path, &self.name),
-            is_dir: self.is_dir,
-            size: self.size,
-            count: 1,
-            depth,
-        };
+        let add_node = (all || self.is_dir) && max_depth >= 0;
 
-        for child in self.children {
-            child.flatten(output, &mut result, seen, depth + 1);
+        // fast_path_join isn't free, so only create a FlatNode if we need it
+        if add_node || !self.children.is_empty() {
+            let mut result = FlatNode {
+                path: fast_path_join(&parent.path, &self.name),
+                size: self.size,
+                count: 1,
+            };
+
+            for child in &self.children {
+                child.flatten(output, &mut result, seen, all, max_depth - 1);
+            }
+
+            parent.size += result.size;
+            parent.count += result.count;
+
+            if add_node {
+                output.push(result);
+            }
+        } else {
+            parent.size += self.size;
+            parent.count += 1;
         }
-
-        parent.size += result.size;
-        parent.count += result.count;
-
-        output.push(result);
     }
 
     fn total_count(&self) -> usize {
@@ -340,7 +347,7 @@ struct DuArgs {
         long = "max-depth",
         help = "Only show entries up to this maximum depth"
     )]
-    max_depth: Option<usize>,
+    max_depth: Option<isize>,
 
     #[arg(short = 's', long = "summarize", help = "Same as --max-depth=0")]
     summarize: bool,
@@ -364,11 +371,11 @@ impl DuArgs {
         }
     }
 
-    fn max_depth(&self) -> Option<usize> {
+    fn max_depth(&self) -> isize {
         if self.summarize {
-            Some(0)
+            0
         } else {
-            self.max_depth
+            self.max_depth.unwrap_or(isize::MAX)
         }
     }
 
@@ -495,10 +502,8 @@ fn main() -> std::io::Result<()> {
 
     let mut total = FlatNode {
         count: 0,
-        is_dir: true,
         path: PathBuf::new().into(),
         size: 0,
-        depth: 0,
     };
 
     if args.show_total {
@@ -517,20 +522,18 @@ fn main() -> std::io::Result<()> {
     };
 
     for root in roots {
-        root.flatten(&mut items, &mut total, &mut seen, 0);
-    }
-
-    if let Some(max_depth) = args.max_depth() {
-        items.retain(|x| x.depth <= max_depth);
+        root.flatten(
+            &mut items,
+            &mut total,
+            &mut seen,
+            args.all,
+            args.max_depth(),
+        );
     }
 
     if args.show_total {
         total.path = PathBuf::from("total").into();
         items.push(total);
-    }
-
-    if !args.all {
-        items.retain(|x| x.is_dir);
     }
 
     if args.reverse {
