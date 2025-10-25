@@ -24,17 +24,17 @@ use rayon::prelude::*;
 #[derive(Debug)]
 struct Node {
     name: Box<OsStr>,
-    is_dir: bool,
+    /// Always 1 if counting inodes
     size: u64,
     inode: u64,
     device: u64,
-    children: Box<[Node]>,
+    /// None for files, Some([]) for empty directories
+    children: Option<Box<[Node]>>,
 }
 
 #[derive(Debug)]
 struct FlatNode {
     size: u64,
-    count: usize,
     path: Box<Path>,
 }
 
@@ -44,25 +44,33 @@ impl Node {
         use std::os::unix::fs::MetadataExt;
         Node {
             name,
-            is_dir: metadata.is_dir(),
-            size: if args.use_apparent_size() {
+            size: if args.inodes {
+                1
+            } else if args.use_apparent_size() {
                 metadata.len()
             } else {
                 metadata.blocks() * 512
             },
             inode: metadata.ino(),
             device: metadata.dev(),
-            children: Default::default(),
+            children: if metadata.is_dir() {
+                Some(Default::default())
+            } else {
+                None
+            },
         }
     }
 
     #[cfg(not(unix))]
-    fn new(name: Box<OsStr>, metadata: &Metadata, _args: &DuArgs) -> Node {
+    fn new(name: Box<OsStr>, metadata: &Metadata, args: &DuArgs) -> Node {
         Node {
             name,
-            children: Default::default(),
-            is_dir: metadata.is_dir(),
-            size: metadata.len(),
+            children: if metadata.is_dir() {
+                Some(Default::default())
+            } else {
+                None
+            },
+            size: if args.inodes { 1 } else { metadata.len() },
             inode: 0,
             device: 0,
         }
@@ -82,35 +90,32 @@ impl Node {
             }
         }
 
-        let add_node = (all || self.is_dir) && max_depth >= 0;
+        let add_node = (all || self.is_dir()) && max_depth >= 0;
 
         // fast_path_join isn't free, so only create a FlatNode if we need it
-        if add_node || !self.children.is_empty() {
+        if add_node || !self.children().is_empty() {
             let mut result = FlatNode {
                 path: fast_path_join(&parent.path, &self.name),
                 size: self.size,
-                count: 1,
             };
 
-            for child in &self.children {
+            for child in self.children() {
                 child.flatten(output, &mut result, seen, all, max_depth - 1);
             }
 
             parent.size += result.size;
-            parent.count += result.count;
 
             if add_node {
                 output.push(result);
             }
         } else {
             parent.size += self.size;
-            parent.count += 1;
         }
     }
 
     fn total_count(&self) -> usize {
         let mut total = 1;
-        for node in &self.children {
+        for node in self.children() {
             total += node.total_count();
         }
         total
@@ -158,15 +163,16 @@ impl Node {
 
         nodes
             .iter_mut()
-            .filter(|node| node.is_dir)
+            .filter(|node| node.is_dir())
             .collect::<Vec<_>>()
             .into_par_iter()
             .with_max_len(1)
             .for_each(|node| {
-                node.children =
+                node.children = Some(
                     Node::read_children(&fast_path_join(path, &node.name), args, root, output)
                         .inspect_err(|e| output.log_error(e))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                )
             });
 
         Ok(nodes)
@@ -181,13 +187,22 @@ impl Node {
         let metadata = metadata.as_ref().map_err(|e| add_context(e, &path))?;
         let mut node = Node::new(OsString::from(path).into(), metadata, args);
 
-        if node.is_dir {
-            node.children = Node::read_children(Path::new(&node.name), args, &node, output)?
+        if metadata.is_dir() {
+            let path = Path::new(&node.name);
+            node.children = Some(Node::read_children(path, args, &node, output)?)
         }
 
         output.add_total(1);
 
         Ok(node)
+    }
+
+    fn is_dir(&self) -> bool {
+        self.children.is_some()
+    }
+
+    fn children(&self) -> &[Node] {
+        self.children.as_deref().unwrap_or(&[])
     }
 }
 
@@ -493,7 +508,6 @@ fn main() -> std::io::Result<()> {
     let mut count = roots.iter().map(Node::total_count).sum();
 
     let mut total = FlatNode {
-        count: 0,
         path: PathBuf::new().into(),
         size: 0,
     };
@@ -529,17 +543,9 @@ fn main() -> std::io::Result<()> {
     }
 
     if args.reverse {
-        if args.inodes {
-            items.par_sort_unstable_by_key(|x| Reverse(x.count));
-        } else {
-            items.par_sort_unstable_by_key(|x| Reverse(x.size));
-        }
+        items.par_sort_unstable_by_key(|x| Reverse(x.size));
     } else if args.sort {
-        if args.inodes {
-            items.par_sort_unstable_by_key(|x| x.count);
-        } else {
-            items.par_sort_unstable_by_key(|x| x.size);
-        }
+        items.par_sort_unstable_by_key(|x| x.size);
     }
 
     if let Some(limit) = args.limit {
@@ -570,13 +576,12 @@ impl FlatNode {
     fn format_line(&self, args: &DuArgs) -> String {
         let format = args.output_format();
         let newline = if args.null { '\0' } else { '\n' };
-        let count = self.count;
         let size = self.size;
         let blocks = size / 512;
 
         let size_string = if args.du_compatible {
             match format {
-                OutputFormat::Count => format!("{count}"),
+                OutputFormat::Count => format!("{size}"),
                 OutputFormat::Bytes => format!("{size}"),
                 OutputFormat::Human => format_bytes(size, true, true),
                 OutputFormat::SI => format_bytes(size, false, true),
@@ -584,7 +589,7 @@ impl FlatNode {
             }
         } else {
             match format {
-                OutputFormat::Count => format!("{count} inodes"),
+                OutputFormat::Count => format!("{size} inodes"),
                 OutputFormat::Bytes => format!("{size} bytes"),
                 OutputFormat::Human => format_bytes(size, true, false),
                 OutputFormat::SI => format_bytes(size, false, false),
