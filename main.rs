@@ -142,15 +142,7 @@ impl Node {
                     .as_ref()
                     .map_err(|e| add_context(e, &entry.path()))?;
 
-                let name = entry.file_name();
-
-                assert_eq!(
-                    name.len(),
-                    name.capacity(),
-                    "DirEntry::file_name allocated extra capacity"
-                );
-
-                let node = Node::new(name.into(), metadata, args);
+                let node = Node::new(entry.file_name().into(), metadata, args);
 
                 if args.one_file_system && node.device != root.device {
                     return Ok(None);
