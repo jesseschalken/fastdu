@@ -1,10 +1,13 @@
 use clap::ArgAction;
+use clap::Parser;
+use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Write};
 use std::fs::Metadata;
 use std::io::{self, IsTerminal, Write as _, stderr};
 use std::path::{Path, PathBuf};
@@ -16,10 +19,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
 use std::{thread, u64};
-
-use clap::Parser;
-use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
 
 #[derive(Debug)]
 struct Node {
@@ -556,7 +555,11 @@ fn main() -> std::io::Result<()> {
 
     items
         .into_par_iter()
-        .map(|item| item.format_line(&args))
+        .map(|item| {
+            let mut buffer = String::with_capacity(item.path.as_os_str().len() + 32);
+            item.format_line(&args, &mut buffer).unwrap();
+            buffer
+        })
         .collect_into_vec(&mut lines);
 
     let mut stdout = io::stdout().lock();
@@ -573,70 +576,75 @@ fn main() -> std::io::Result<()> {
 }
 
 impl FlatNode {
-    fn format_line(&self, args: &DuArgs) -> String {
+    fn format_line(&self, args: &DuArgs, out: &mut dyn Write) -> fmt::Result {
         let format = args.output_format();
         let newline = if args.null { '\0' } else { '\n' };
         let size = self.size;
         let blocks = size / 512;
 
-        let size_string = if args.du_compatible {
+        if args.du_compatible {
             match format {
-                OutputFormat::Count => format!("{size}"),
-                OutputFormat::Bytes => format!("{size}"),
-                OutputFormat::Human => format_bytes(size, true, true),
-                OutputFormat::SI => format_bytes(size, false, true),
-                OutputFormat::Blocks => format!("{blocks}"),
+                OutputFormat::Count => write!(out, "{size}"),
+                OutputFormat::Bytes => write!(out, "{size}"),
+                OutputFormat::Human => format_size(size, true, true, out),
+                OutputFormat::SI => format_size(size, false, true, out),
+                OutputFormat::Blocks => write!(out, "{blocks}"),
             }
         } else {
             match format {
-                OutputFormat::Count => format!("{size} inodes"),
-                OutputFormat::Bytes => format!("{size} bytes"),
-                OutputFormat::Human => format_bytes(size, true, false),
-                OutputFormat::SI => format_bytes(size, false, false),
-                OutputFormat::Blocks => format!("{blocks} blocks"),
+                OutputFormat::Count => write!(out, "{size:>16} inodes"),
+                OutputFormat::Bytes => write!(out, "{size:>16} bytes"),
+                OutputFormat::Human => format_size(size, true, false, out),
+                OutputFormat::SI => format_size(size, false, false, out),
+                OutputFormat::Blocks => write!(out, "{blocks:>16} blocks"),
             }
-        };
+        }?;
 
         if args.du_compatible {
-            format!("{size_string}\t{}{newline}", self.path.display())
+            write!(out, "\t{}{newline}", self.path.display())
         } else {
-            format!("{size_string:>18}  {}{newline}", self.path.display())
+            write!(out, "  {}{newline}", self.path.display())
         }
     }
 }
 
-fn format_bytes(bytes: u64, binary: bool, du_compatible: bool) -> String {
+fn format_size(bytes: u64, binary: bool, du_compatible: bool, out: &mut dyn Write) -> fmt::Result {
     let mut factor: u64 = 1;
     let mut power = 0;
-    let mut result = bytes as f64;
+    let mut result = bytes;
+    let kilo = if binary { 1024 } else { 1000 };
 
-    while result >= 1000.0 {
-        factor *= if binary { 1024 } else { 1000 };
+    while result >= if du_compatible { 1000 } else { kilo } {
+        factor *= kilo;
         power += 1;
-        result = bytes as f64 / factor as f64;
+        result /= kilo;
     }
 
-    let suffix = if binary { "iB" } else { "B" };
+    let result_float = bytes as f64 / factor as f64;
+
+    let suffix = if binary && power > 0 { "iB" } else { "B" };
     let prefix = match power {
         0 => "",
         1 if !binary => "k",
         _ => &"KMGTPEZYRQ"[power - 1..][..1],
     };
 
-    match power {
-        0 if du_compatible => format!("{:>3}B", bytes),
-        _ if du_compatible => format!("{:>3}{}", format_float_du_compat(result), prefix),
-        0 => format!("{} B", bytes),
-        _ => format!("{:.3} {}{}", result, prefix, suffix),
-    }
-}
-
-fn format_float_du_compat(num: f64) -> String {
-    // We have only 3 chars of space, so format with one decimal point if <10
-    let rounded = (num * 10.0).round() / 10.0;
-    if rounded < 10.0 {
-        format!("{:.1}", rounded)
+    if du_compatible {
+        if power == 0 {
+            write!(out, "{:>3}B", bytes)
+        } else {
+            // We have only 3 chars of space, so format with one decimal point if <10
+            let rounded = (result_float * 10.0).round() / 10.0;
+            if rounded < 10.0 {
+                write!(out, "{:>3.1}{prefix}", rounded)
+            } else {
+                write!(out, "{:>3.0}{prefix}", result_float.round())
+            }
+        }
     } else {
-        format!("{:.0}", num.round())
+        // "1017.234 KiB".len() == 12
+        let num_len = 12 - 1 - prefix.len() - suffix.len();
+        let precision = if power == 0 { 0 } else { 3 };
+        write!(out, "{result_float:>num_len$.precision$} {prefix}{suffix}")
     }
 }
