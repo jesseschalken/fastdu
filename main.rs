@@ -1,13 +1,16 @@
 use clap::ArgAction;
 use clap::Parser;
+use dashmap::DashSet;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::FxBuildHasher;
+use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::HashSet;
 use std::error::Error;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt::{self, Debug, Write};
+use std::fs;
 use std::fs::Metadata;
 use std::io::{self, IsTerminal, Write as _, stderr};
 use std::path::{Path, PathBuf};
@@ -24,97 +27,124 @@ use std::{thread, u64};
 struct Node {
     name: Box<OsStr>,
     /// Always 1 if counting inodes
-    size: u64,
-    inode: u64,
-    device: u64,
-    /// None for files, Some([]) for empty directories
-    children: Option<Box<[Node]>>,
+    self_size: u64,
+    total_size: u64,
+    file_type: fs::FileType,
+    children: Box<[Node]>,
 }
 
 #[derive(Debug)]
 struct FlatNode {
     size: u64,
-    path: Box<Path>,
+    path: Box<str>,
+}
+
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
+struct InodeKey {
+    ino: u64,
+    dev: u64,
+}
+
+impl InodeKey {
+    #[cfg(unix)]
+    fn create(metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                ino: metadata.ino(),
+                dev: metadata.dev(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self { ino: 0, dev: 0 }
+        }
+    }
+}
+
+fn os_string_into_string_lossy(s: OsString) -> String {
+    s.into_string()
+        .unwrap_or_else(|s| s.to_string_lossy().into_owned())
+}
+
+type FxDashSet<T> = DashSet<T, FxBuildHasher>;
+
+fn get_blocks(metadata: &Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.blocks() * 512
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
 }
 
 impl Node {
-    #[cfg(unix)]
-    fn new(name: Box<OsStr>, metadata: &Metadata, args: &DuArgs) -> Node {
-        use std::os::unix::fs::MetadataExt;
-        Node {
-            name,
-            size: if args.inodes {
-                1
-            } else if args.use_apparent_size() {
-                metadata.len()
-            } else {
-                metadata.blocks() * 512
-            },
-            inode: metadata.ino(),
-            device: metadata.dev(),
-            children: if metadata.is_dir() {
-                Some(Default::default())
-            } else {
-                None
-            },
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn new(name: Box<OsStr>, metadata: &Metadata, args: &DuArgs) -> Node {
-        Node {
-            name,
-            children: if metadata.is_dir() {
-                Some(Default::default())
-            } else {
-                None
-            },
-            size: if args.inodes { 1 } else { metadata.len() },
-            inode: 0,
-            device: 0,
-        }
-    }
-
-    fn flatten(
+    fn flatten_tree(
         &self,
         output: &mut Vec<FlatNode>,
-        parent: &mut FlatNode,
-        seen: &mut Option<FxHashSet<(u64, u64)>>,
-        all: bool,
-        max_depth: isize,
+        self_prefix: [&str; 2],
+        child_prefix: [&str; 2],
+        args: &DuArgs,
+        depth: usize,
     ) {
-        if let Some(seen) = seen {
-            if !seen.insert((self.device, self.inode)) {
-                return;
+        let name = self.name.to_string_lossy();
+        let children = self
+            .children
+            .iter()
+            .filter(|child| args.accept(child, depth + 1))
+            .collect::<Vec<_>>();
+
+        output.push(FlatNode {
+            size: self.total_size,
+            path: match (self_prefix, &*children) {
+                (["", ""], []) => join_strs(["· ", &name]).into(),
+                (["", ""], _) => join_strs(["╷ ", &name]).into(),
+                ([a, b], []) => join_strs([a, b, "╴ ", &name]).into(),
+                ([a, b], _) => join_strs([a, b, "╮ ", &name]).into(),
+            },
+        });
+
+        if let [children @ .., last_child] = &*children {
+            let prefix = join_strs(child_prefix);
+
+            for child in children {
+                child.flatten_tree(output, [&prefix, "├─"], [&prefix, "│ "], args, depth + 1);
             }
+
+            last_child.flatten_tree(output, [&prefix, "╰─"], [&prefix, "  "], args, depth + 1);
+        }
+    }
+
+    fn flatten_joined(
+        &self,
+        output: &mut Vec<FlatNode>,
+        parent_path: &Path,
+        args: &DuArgs,
+        depth: usize,
+    ) {
+        if !args.accept(&self, depth) {
+            return;
         }
 
-        let add_node = (all || self.is_dir()) && max_depth >= 0;
+        let path = fast_path_join(parent_path, &self.name);
 
-        // fast_path_join isn't free, so only create a FlatNode if we need it
-        if add_node || !self.children().is_empty() {
-            let mut result = FlatNode {
-                path: fast_path_join(&parent.path, &self.name),
-                size: self.size,
-            };
-
-            for child in self.children() {
-                child.flatten(output, &mut result, seen, all, max_depth - 1);
-            }
-
-            parent.size += result.size;
-
-            if add_node {
-                output.push(result);
-            }
-        } else {
-            parent.size += self.size;
+        for child in &self.children {
+            child.flatten_joined(output, &path, args, depth + 1);
         }
+
+        output.push(FlatNode {
+            path: os_string_into_string_lossy(path.into()).into(),
+            size: self.total_size,
+        });
     }
 
     fn total_count(&self) -> usize {
         let mut total = 1;
-        for node in self.children() {
+        for node in &self.children {
             total += node.total_count();
         }
         total
@@ -123,8 +153,9 @@ impl Node {
     fn read_children(
         path: &Path,
         args: &DuArgs,
-        root: &Node,
+        root: &InodeKey,
         output: &dyn Output,
+        seen: &FxDashSet<InodeKey>,
     ) -> io::Result<Box<[Node]>> {
         // Build nodes before recursing on subdirectories so we close the
         // directory handle and don't get a "Too many open files" error.
@@ -135,24 +166,55 @@ impl Node {
             .map_err(|e| add_context(e, path))?
             .map(|result| -> io::Result<_> {
                 let entry = result.as_ref().map_err(|e| add_context(e, path))?;
+                let file_type;
+                let size;
 
-                let metadata = if args.dereference_all {
-                    entry.path().metadata()
+                if args.dereference_all || args.one_file_system || !args.count_links || !args.inodes
+                {
+                    let metadata = if args.dereference_all {
+                        entry.path().metadata()
+                    } else {
+                        entry.metadata()
+                    };
+
+                    let metadata = metadata
+                        .as_ref()
+                        .map_err(|e| add_context(e, &entry.path()))?;
+
+                    if cfg!(unix) {
+                        let inode = InodeKey::create(metadata);
+
+                        if args.one_file_system && inode.dev != root.dev {
+                            return Ok(None);
+                        }
+
+                        if !args.count_links && !seen.insert(inode) {
+                            return Ok(None);
+                        }
+                    }
+
+                    file_type = metadata.file_type();
+                    size = if args.inodes {
+                        1
+                    } else if args.use_apparent_size() {
+                        metadata.len()
+                    } else {
+                        get_blocks(metadata)
+                    };
                 } else {
-                    entry.metadata()
-                };
-
-                let metadata = metadata
-                    .as_ref()
-                    .map_err(|e| add_context(e, &entry.path()))?;
-
-                let node = Node::new(entry.file_name().into(), metadata, args);
-
-                if args.one_file_system && node.device != root.device {
-                    return Ok(None);
+                    file_type = entry
+                        .file_type()
+                        .map_err(|e| add_context(&e, &entry.path()))?;
+                    size = 1;
                 }
 
-                Ok(Some(node))
+                Ok(Some(Node {
+                    name: entry.file_name().into(),
+                    self_size: size,
+                    total_size: size,
+                    file_type,
+                    children: Default::default(),
+                }))
             })
             .flat_map(|result| result.inspect_err(|e| output.log_error(e)))
             .flatten()
@@ -167,45 +229,79 @@ impl Node {
             .into_par_iter()
             .with_max_len(1)
             .for_each(|node| {
-                node.children = Some(
-                    Node::read_children(&fast_path_join(path, &node.name), args, root, output)
-                        .inspect_err(|e| output.log_error(e))
-                        .unwrap_or_default(),
-                )
+                let path = fast_path_join(path, &node.name);
+
+                node.children = Node::read_children(&path, args, root, output, seen)
+                    .inspect_err(|e| output.log_error(e))
+                    .unwrap_or_default();
+
+                node.recalculate_total_size();
             });
 
         Ok(nodes)
     }
 
-    fn read(path: PathBuf, args: &DuArgs, output: &dyn Output) -> io::Result<Node> {
+    fn read(
+        path: PathBuf,
+        args: &DuArgs,
+        output: &dyn Output,
+        seen: &FxDashSet<InodeKey>,
+    ) -> io::Result<Option<Node>> {
         let metadata = if args.dereference_args || args.dereference_all {
             path.metadata()
         } else {
             path.symlink_metadata()
         };
         let metadata = metadata.as_ref().map_err(|e| add_context(e, &path))?;
-        let mut node = Node::new(OsString::from(path).into(), metadata, args);
+
+        let inode = InodeKey::create(metadata);
+
+        if cfg!(unix) && !seen.insert(inode) {
+            return Ok(None);
+        }
+
+        let size = if args.inodes {
+            1
+        } else if args.use_apparent_size() {
+            metadata.len()
+        } else {
+            get_blocks(metadata)
+        };
+
+        let mut node = Node {
+            name: OsString::from(path).into(),
+            self_size: size,
+            total_size: size,
+            file_type: metadata.file_type(),
+            children: Default::default(),
+        };
 
         if metadata.is_dir() {
             let path = Path::new(&node.name);
-            node.children = Some(Node::read_children(path, args, &node, output)?)
+            node.children = Node::read_children(path, args, &inode, output, seen)?;
+            node.recalculate_total_size();
         }
 
         output.add_total(1);
 
-        Ok(node)
+        Ok(Some(node))
     }
 
     fn is_dir(&self) -> bool {
-        self.children.is_some()
+        self.file_type.is_dir()
     }
 
-    fn children(&self) -> &[Node] {
-        self.children.as_deref().unwrap_or(&[])
+    fn recalculate_total_size(&mut self) {
+        self.total_size = self
+            .children
+            .iter()
+            .map(|child| child.total_size)
+            .sum::<u64>()
+            + self.self_size;
     }
 }
 
-fn fast_path_join(path: &Path, name: &OsStr) -> Box<Path> {
+fn fast_path_join(path: &Path, name: &OsStr) -> PathBuf {
     // Assume the result will be {path}/{name} so that in most
     // cases .into_boxed_path() doesn't reallocate.
     let mut result = OsString::with_capacity(path.as_os_str().len() + 1 + name.len());
@@ -213,7 +309,7 @@ fn fast_path_join(path: &Path, name: &OsStr) -> Box<Path> {
     result.push(path);
     let mut result = PathBuf::from(result);
     result.push(name);
-    result.into_boxed_path()
+    result
 }
 
 fn add_context(error: &io::Error, path: &Path) -> io::Error {
@@ -272,11 +368,7 @@ struct DuArgs {
     )]
     si: bool,
 
-    #[arg(
-        short = None,
-        long = "inodes",
-        help = "Count inodes instead of size"
-    )]
+    #[arg(short = 'i', long = "inodes", help = "Count inodes instead of size")]
     inodes: bool,
 
     #[arg(
@@ -320,6 +412,13 @@ struct DuArgs {
     reverse: bool,
 
     #[arg(
+        short = 't',
+        long = "tree",
+        help = "Show a tree view of the directory structure"
+    )]
+    tree: bool,
+
+    #[arg(
         short = 'j',
         long = "num-threads",
         help = "Thread count, defaults to 2x the number of CPU cores"
@@ -353,7 +452,7 @@ struct DuArgs {
         long = "max-depth",
         help = "Only show entries up to this maximum depth"
     )]
-    max_depth: Option<isize>,
+    max_depth: Option<usize>,
 
     #[arg(short = 's', long = "summarize", help = "Same as --max-depth=0")]
     summarize: bool,
@@ -377,14 +476,6 @@ impl DuArgs {
         }
     }
 
-    fn max_depth(&self) -> isize {
-        if self.summarize {
-            0
-        } else {
-            self.max_depth.unwrap_or(isize::MAX)
-        }
-    }
-
     fn use_apparent_size(&self) -> bool {
         self.apparent_size || (self.bytes && !self.blocks)
     }
@@ -403,6 +494,38 @@ impl DuArgs {
                 total_count,
             })
         })
+    }
+
+    fn accept(&self, node: &Node, depth: usize) -> bool {
+        if !self.all && !node.is_dir() {
+            return false;
+        }
+
+        if depth > 0 && self.summarize {
+            return false;
+        }
+
+        if let Some(max_depth) = self.max_depth {
+            if depth > max_depth {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+fn join_strs<const N: usize>(strs: [&str; N]) -> Cow<'_, str> {
+    match &strs as &[&str] {
+        [] => "".into(),
+        [s] | [s, ""] | ["", s] => (*s).into(),
+        _ => {
+            let mut result = String::with_capacity(strs.iter().copied().map(str::len).sum());
+            for s in strs {
+                result.push_str(s);
+            }
+            result.into()
+        }
     }
 }
 
@@ -494,12 +617,16 @@ fn main() -> std::io::Result<()> {
         .build_global()
         .expect("Failed to set thread pool");
 
+    let seen = FxDashSet::default();
     let roots: Vec<Node> = args.with_output(|output| {
         args.files_or_directories
             .par_iter()
             .with_max_len(1)
             .flat_map_iter(|path| {
-                Node::read(path.into(), &args, output).inspect_err(|e| output.log_error(e))
+                Node::read(path.into(), &args, output, &seen)
+                    .inspect_err(|e| output.log_error(e))
+                    .ok()
+                    .flatten()
             })
             .collect()
     });
@@ -507,7 +634,7 @@ fn main() -> std::io::Result<()> {
     let mut count = roots.iter().map(Node::total_count).sum();
 
     let mut total = FlatNode {
-        path: PathBuf::new().into(),
+        path: "total".into(),
         size: 0,
     };
 
@@ -517,34 +644,28 @@ fn main() -> std::io::Result<()> {
 
     let mut items = Vec::with_capacity(count);
 
-    let mut seen = if !args.count_links && cfg!(unix) {
-        Some(HashSet::with_capacity_and_hasher(
-            count,
-            FxBuildHasher::default(),
-        ))
-    } else {
-        None
-    };
-
     for root in roots {
-        root.flatten(
-            &mut items,
-            &mut total,
-            &mut seen,
-            args.all,
-            args.max_depth(),
-        );
+        total.size += root.total_size;
+
+        if args.accept(&root, 0) {
+            if args.tree {
+                root.flatten_tree(&mut items, ["", ""], ["", ""], &args, 0);
+            } else {
+                root.flatten_joined(&mut items, Path::new(""), &args, 0);
+            }
+        }
     }
 
     if args.show_total {
-        total.path = PathBuf::from("total").into();
         items.push(total);
     }
 
-    if args.reverse {
-        items.par_sort_unstable_by_key(|x| Reverse(x.size));
-    } else if args.sort {
-        items.par_sort_unstable_by_key(|x| x.size);
+    if !args.tree {
+        if args.reverse {
+            items.par_sort_unstable_by_key(|x| Reverse(x.size));
+        } else if args.sort {
+            items.par_sort_unstable_by_key(|x| x.size);
+        }
     }
 
     if let Some(limit) = args.limit {
@@ -556,7 +677,7 @@ fn main() -> std::io::Result<()> {
     items
         .into_par_iter()
         .map(|item| {
-            let mut buffer = String::with_capacity(item.path.as_os_str().len() + 32);
+            let mut buffer = String::with_capacity(item.path.len() + 32);
             item.format_line(&args, &mut buffer).unwrap();
             buffer
         })
@@ -601,9 +722,9 @@ impl FlatNode {
         }?;
 
         if args.du_compatible {
-            write!(out, "\t{}{newline}", self.path.display())
+            write!(out, "\t{}{newline}", self.path)
         } else {
-            write!(out, "  {}{newline}", self.path.display())
+            write!(out, "  {}{newline}", self.path)
         }
     }
 }

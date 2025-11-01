@@ -12,6 +12,7 @@ repository = "https://github.com/jesseschalken/fastdu"
 rayon = "1.10.0"
 clap = { version = "4.5.35", features = ["derive"] }
 rustc-hash = "2.1.1"
+dashmap = "6.1.0"
 
 [[bin]]
 name = "fastdu"
