@@ -5,7 +5,7 @@ parallel, cross-platform implementation of `du`
 
 `fastdu` is a Rust implementation of GNU `du`, supporting most options and with the following additions:
 
-1. Ability to sort output in ascending (`-S`) or descending (`-r`) order and take the first N entries (eg `-n 100`).
+1. Ability to sort output in ascending (`-S`) or descending (`-R`) order and take the first N entries (eg `-n 100`).
 2. Display of progress and average speed while the filesystem is being scanned (can be disabled with `--no-progress`).
 3. Parallel execution of filesystem operations using Rayon, with an adjustible thread count (eg `-j 10`).
 4. Windows support, including efficient retrieval of file metadata using [`DirEntry::metadata`](https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.metadata).

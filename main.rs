@@ -6,16 +6,25 @@ use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::borrow::Cow;
+use std::cell::LazyCell;
 use std::cmp::Reverse;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::fmt::{self, Debug, Write};
+use std::fmt;
+use std::fmt::Debug;
 use std::fs;
 use std::fs::Metadata;
-use std::io::{self, IsTerminal, Write as _, stderr};
+use std::fs::read_link;
+use std::io::Write;
+use std::io::{self, IsTerminal, Result, stderr};
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
@@ -32,15 +41,17 @@ struct Node {
     name: Box<OsStr>,
     /// Always 1 if counting inodes
     self_size: u64,
-    total_size: u64,
+    children_size: u64,
     file_type: fs::FileType,
     children: Box<[Node]>,
+    link_contents: Option<Box<Path>>,
 }
 
 #[derive(Debug)]
 struct FlatNode {
     size: u64,
     path: Box<str>,
+    file_type: Option<fs::FileType>,
 }
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
@@ -50,20 +61,16 @@ struct InodeKey {
 }
 
 impl InodeKey {
-    #[cfg(unix)]
     fn create(metadata: &Metadata) -> Self {
+        // So metadata is considered used when #[cfg(not(unix))]
+        let _ = metadata;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Self {
-                ino: metadata.ino(),
-                dev: metadata.dev(),
-            }
-        }
+        return Self {
+            ino: metadata.ino(),
+            dev: metadata.dev(),
+        };
         #[cfg(not(unix))]
-        {
-            Self { ino: 0, dev: 0 }
-        }
+        return Self { ino: 0, dev: 0 };
     }
 }
 
@@ -74,19 +81,35 @@ fn os_string_into_string_lossy(s: OsString) -> String {
 
 type FxDashSet<T> = DashSet<T, FxBuildHasher>;
 
-fn get_blocks(metadata: &Metadata) -> u64 {
+fn get_disk_size(metadata: &Metadata) -> u64 {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.blocks() * 512
-    }
+    return metadata.blocks() * 512;
     #[cfg(not(unix))]
-    {
-        metadata.len()
-    }
+    return metadata.len();
 }
 
+static BLOCK_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    for var in ["DU_BLOCK_SIZE", "BLOCK_SIZE", "BLOCKSIZE"] {
+        if let Some(value) = std::env::var_os(var) {
+            return value
+                .into_string()
+                .unwrap_or_else(|x| panic!("{var} is not valid UTF-8: {x:?}"))
+                .parse()
+                .unwrap_or_else(|e| panic!("{var} is not a valid integer: {e}"));
+        }
+    }
+
+    let posix_mode = std::env::var_os("POSIXLY_CORRECT").is_some();
+    if posix_mode { 512 } else { 1024 }
+});
+
 impl Node {
+    fn flatten_tree_root(&self, output: &mut Vec<FlatNode>, args: &DuArgs) {
+        if args.should_output(self, 0) {
+            self.flatten_tree(output, ["", ""], ["", ""], args, 0);
+        }
+    }
+
     fn flatten_tree(
         &self,
         output: &mut Vec<FlatNode>,
@@ -99,17 +122,25 @@ impl Node {
         let children = self
             .children
             .iter()
-            .filter(|child| args.accept(child, depth + 1))
+            .filter(|child| args.should_output(child, depth + 1))
             .collect::<Vec<_>>();
 
+        let mut path: String = match (self_prefix, &*children) {
+            (["", ""], []) => join_strs(["· ", &name]),
+            (["", ""], _) => join_strs(["╷ ", &name]),
+            ([a, b], []) => join_strs([a, b, "╴ ", &name]),
+            ([a, b], _) => join_strs([a, b, "╮ ", &name]),
+        }
+        .into();
+
+        if let Some(link_contents) = &self.link_contents {
+            path = join_strs([&path, " → ", &link_contents.to_string_lossy()]).into();
+        }
+
         output.push(FlatNode {
-            size: self.total_size,
-            path: match (self_prefix, &*children) {
-                (["", ""], []) => join_strs(["· ", &name]).into(),
-                (["", ""], _) => join_strs(["╷ ", &name]).into(),
-                ([a, b], []) => join_strs([a, b, "╴ ", &name]).into(),
-                ([a, b], _) => join_strs([a, b, "╮ ", &name]).into(),
-            },
+            size: self.total_size(),
+            path: path.into(),
+            file_type: Some(self.file_type),
         });
 
         if let [children @ .., last_child] = &*children {
@@ -130,7 +161,7 @@ impl Node {
         args: &DuArgs,
         depth: usize,
     ) {
-        if !args.accept(&self, depth) {
+        if !args.should_output(&self, depth) {
             return;
         }
 
@@ -142,7 +173,8 @@ impl Node {
 
         output.push(FlatNode {
             path: os_string_into_string_lossy(path.into()).into(),
-            size: self.total_size,
+            size: self.children_size,
+            file_type: Some(self.file_type),
         });
     }
 
@@ -160,7 +192,7 @@ impl Node {
         root: &InodeKey,
         output: &dyn Output,
         seen: &FxDashSet<InodeKey>,
-    ) -> io::Result<Box<[Node]>> {
+    ) -> Result<Box<[Node]>> {
         // Build nodes before recursing on subdirectories so we close the
         // directory handle and don't get a "Too many open files" error.
 
@@ -168,55 +200,44 @@ impl Node {
         let mut nodes = retry_if_interrupted(|| path.read_dir())
             .as_mut()
             .map_err(|e| add_context(e, path))?
-            .map(|result| -> io::Result<_> {
+            .map(|result| -> Result<_> {
                 let entry = result.as_ref().map_err(|e| add_context(e, path))?;
-                let file_type;
-                let size;
-
-                if args.dereference_all || args.one_file_system || !args.count_links || !args.inodes
-                {
-                    let metadata = if args.dereference_all {
+                let metadata = LazyCell::new(|| {
+                    if args.dereference_all {
                         entry.path().metadata()
                     } else {
                         entry.metadata()
-                    };
-
-                    let metadata = metadata
-                        .as_ref()
-                        .map_err(|e| add_context(e, &entry.path()))?;
-
-                    if cfg!(unix) {
-                        let inode = InodeKey::create(metadata);
-
-                        if args.one_file_system && inode.dev != root.dev {
-                            return Ok(None);
-                        }
-
-                        if !args.count_links && !seen.insert(inode) {
-                            return Ok(None);
-                        }
                     }
+                });
+                let metadata = || metadata.as_ref().map_err(|e| add_context(e, &entry.path()));
+                let inode = || metadata().map(InodeKey::create);
 
-                    file_type = metadata.file_type();
-                    size = if args.inodes {
-                        1
-                    } else if args.use_apparent_size() {
-                        metadata.len()
-                    } else {
-                        get_blocks(metadata)
-                    };
-                } else {
-                    file_type = entry
-                        .file_type()
-                        .map_err(|e| add_context(&e, &entry.path()))?;
-                    size = 1;
+                if args.one_file_system && inode()?.dev != root.dev {
+                    return Ok(None);
                 }
+
+                if cfg!(unix) && !args.count_links && !seen.insert(inode()?) {
+                    return Ok(None);
+                }
+
+                let file_type = entry
+                    .file_type()
+                    .map_err(|e| add_context(&e, &entry.path()))?;
 
                 Ok(Some(Node {
                     name: entry.file_name().into(),
-                    self_size: size,
-                    total_size: size,
+                    self_size: match args.size_mode() {
+                        SizeMode::Count => 1,
+                        SizeMode::DiskSize => get_disk_size(metadata()?),
+                        SizeMode::Apparent => metadata()?.len(),
+                    },
+                    children_size: 0,
                     file_type,
+                    link_contents: if args.tree && file_type.is_symlink() {
+                        Some(read_link(&entry.path())?.into())
+                    } else {
+                        None
+                    },
                     children: Default::default(),
                 }))
             })
@@ -239,18 +260,18 @@ impl Node {
                     .inspect_err(|e| output.log_error(e))
                     .unwrap_or_default();
 
-                node.recalculate_total_size();
+                node.update_children_size();
             });
 
         Ok(nodes)
     }
 
-    fn read(
+    fn read_root(
         path: PathBuf,
         args: &DuArgs,
         output: &dyn Output,
         seen: &FxDashSet<InodeKey>,
-    ) -> io::Result<Option<Node>> {
+    ) -> Result<Option<Node>> {
         let metadata = if args.dereference_args || args.dereference_all {
             path.metadata()
         } else {
@@ -264,27 +285,32 @@ impl Node {
             return Ok(None);
         }
 
-        let size = if args.inodes {
-            1
-        } else if args.use_apparent_size() {
-            metadata.len()
+        let file_type = metadata.file_type();
+        let link_contents = if args.tree && file_type.is_symlink() {
+            Some(read_link(&path)?.into())
         } else {
-            get_blocks(metadata)
+            None
+        };
+        let children = if file_type.is_dir() {
+            Node::read_children(&path, args, &inode, output, seen)?
+        } else {
+            Default::default()
         };
 
         let mut node = Node {
             name: OsString::from(path).into(),
-            self_size: size,
-            total_size: size,
-            file_type: metadata.file_type(),
-            children: Default::default(),
+            self_size: match args.size_mode() {
+                SizeMode::Count => 1,
+                SizeMode::DiskSize => get_disk_size(metadata),
+                SizeMode::Apparent => metadata.len(),
+            },
+            children_size: 0,
+            file_type,
+            children,
+            link_contents,
         };
 
-        if metadata.is_dir() {
-            let path = Path::new(&node.name);
-            node.children = Node::read_children(path, args, &inode, output, seen)?;
-            node.recalculate_total_size();
-        }
+        node.update_children_size();
 
         output.add_total(1);
 
@@ -295,13 +321,30 @@ impl Node {
         self.file_type.is_dir()
     }
 
-    fn recalculate_total_size(&mut self) {
-        self.total_size = self
-            .children
-            .iter()
-            .map(|child| child.total_size)
-            .sum::<u64>()
-            + self.self_size;
+    fn update_children_size(&mut self) {
+        self.children_size = self.children.iter().map(Node::total_size).sum();
+    }
+
+    fn sort_children(&mut self, no_size: bool, reverse: bool) {
+        let children = &mut self.children;
+
+        if no_size && reverse {
+            children.par_sort_unstable_by(|a, b| a.name.cmp(&b.name).reverse());
+        } else if no_size {
+            children.par_sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        } else if reverse {
+            children.par_sort_unstable_by_key(|x| Reverse(x.total_size()));
+        } else {
+            children.par_sort_unstable_by_key(|x| x.total_size());
+        }
+
+        children
+            .par_iter_mut()
+            .for_each(|child| child.sort_children(no_size, reverse));
+    }
+
+    fn total_size(&self) -> u64 {
+        self.self_size + self.children_size
     }
 }
 
@@ -326,7 +369,7 @@ struct DuArgs {
     #[arg(
         short = 'A',
         long = "apparent-size",
-        help = "Print apparent sizes rather than device usage. This is always true on Windows."
+        help = "Print apparent sizes rather than disk usage. This is always true on Windows."
     )]
     apparent_size: bool,
 
@@ -334,31 +377,79 @@ struct DuArgs {
         short = 'D',
         visible_short_alias = 'H',
         long = "dereference-args",
-        help = "Dereference only symlinks that are listed on the command line"
+        help = "Dereference only symlinks that are listed on the command line",
+        group = "symlink-mode"
     )]
     dereference_args: bool,
 
     #[arg(
         short = 'L',
         long = "dereference",
-        help = "Dereference all symbolic links"
+        help = "Dereference all symbolic links",
+        group = "symlink-mode"
     )]
     dereference_all: bool,
 
     #[arg(
+        short = 'P',
+        long = "no-dereference",
+        help = "Don't dereference any symbolic links. This is the default.",
+        group = "symlink-mode"
+    )]
+    dereference_none: bool,
+
+    #[arg(
         short = 'b',
         long = "bytes",
-        help = "Print size in bytes. Implies --apparent-size unles --blocks is also passed."
+        help = "Print size in bytes. Implies --apparent-size.",
+        group = "size-format"
     )]
     bytes: bool,
 
-    #[arg(short = None, long = "blocks", help = "Print size in 512 byte blocks. This is the default.")]
-    blocks: bool,
+    #[arg(
+        short = 'B',
+        long = "block-size",
+        value_name = "SIZE",
+        help = "Print size in the specified block size (in bytes)",
+        group = "size-format"
+    )]
+    block_size: Option<u64>,
+
+    #[arg(
+        short = 'k',
+        long = "kilos",
+        visible_aliases = ["kibis"],
+        help = "Print size in 1024-byte blocks",
+        group = "size-format"
+    )]
+    kibis: bool,
+
+    #[arg(
+        short = 'm',
+        long = "megas",
+        visible_alias = "mebis",
+        help = "Print size in 1048576-byte blocks",
+        group = "size-format"
+    )]
+    mebis: bool,
+
+    #[arg(
+        short = 'g',
+        long = "gigas",
+        visible_alias = "gibis",
+        help = "Print size in 1073741824-byte blocks",
+        group = "size-format"
+    )]
+    gibis: bool,
+
+    #[arg(short = 'r', help = "Unused, accepted for conformance with XPG4")]
+    messages: bool,
 
     #[arg(
         short = 'h',
         long = "human-readable",
-        help = "Print sizes in human readable format (KiB, MiB etc)"
+        help = "Print sizes in human readable format (KiB, MiB etc)",
+        group = "size-format"
     )]
     human: bool,
 
@@ -366,19 +457,24 @@ struct DuArgs {
     sort: bool,
 
     #[arg(
-        short = None,
         long = "si",
-        help = "Like -h, but use powers of 1000 (KB, MB etc) instead of 1024"
+        help = "Like -h, but use powers of 1000 (KB, MB etc) instead of 1024",
+        group = "size-format"
     )]
     si: bool,
 
-    #[arg(short = 'i', long = "inodes", help = "Count inodes instead of size")]
+    #[arg(
+        short = 'i',
+        long = "inodes",
+        help = "Count inodes instead of size",
+        group = "size-format"
+    )]
     inodes: bool,
 
     #[arg(
         short = 'l',
         long = "count-links",
-        help = "Count sizes many times if hard linked. No effect on Windows."
+        help = "Count sizes many times if hard linked. This is always true on Windows."
     )]
     count_links: bool,
 
@@ -408,7 +504,7 @@ struct DuArgs {
     help: (),
 
     #[arg(
-        short = 'r',
+        short = 'R',
         long = "reverse",
         default_value_t = false,
         help = "Sort output (descending order)"
@@ -416,7 +512,18 @@ struct DuArgs {
     reverse: bool,
 
     #[arg(
-        short = 't',
+        short = 'z',
+        long = "no-size",
+        help = "Do not print or sort by sizes, only names/paths",
+        group = "size-format"
+    )]
+    no_size: bool,
+
+    #[arg(short = 'f', long = "type", help = "Show file type of each entry")]
+    show_type: bool,
+
+    #[arg(
+        short = 'T',
         long = "tree",
         help = "Show a tree view of the directory structure"
     )]
@@ -429,17 +536,14 @@ struct DuArgs {
     )]
     num_threads: Option<usize>,
 
-    #[arg(
-        long = "no-progress",
-        help = "Disable progress output even if stderr is a terminal"
-    )]
+    #[arg(long = "no-progress", help = "Disable progress output")]
     no_progress: bool,
 
     #[arg(help = "Files or directories to scan")]
     files_or_directories: Vec<String>,
 
     #[arg(
-        long = "du-compatible",
+        long = "du",
         help = "Show output in the same format as \"du\". See also --no-progress."
     )]
     du_compatible: bool,
@@ -463,44 +567,61 @@ struct DuArgs {
 
     #[arg(short = 'c', long = "total", help = "Include a grand total")]
     show_total: bool,
+
+    #[arg(
+        short = 't',
+        long = "threshold",
+        help = "Only include entries with size over threshold. If negative, only display values with size below."
+    )]
+    threshold: Option<i64>,
 }
 
 impl DuArgs {
-    fn output_format(&self) -> OutputFormat {
-        if self.inodes {
-            OutputFormat::Count
-        } else if self.bytes {
-            OutputFormat::Bytes
-        } else if self.si {
-            OutputFormat::SI
-        } else if self.human {
-            OutputFormat::Human
-        } else {
-            OutputFormat::Blocks
+    fn size_format(&self) -> Option<SizeFormat> {
+        match () {
+            _ if self.no_size => None,
+            _ if self.inodes => Some(SizeFormat::Count),
+            _ if self.bytes => Some(SizeFormat::Bytes),
+            _ if self.si => Some(SizeFormat::SI),
+            _ if self.human => Some(SizeFormat::Human),
+            _ if self.kibis => Some(SizeFormat::Blocks(1024)),
+            _ if self.mebis => Some(SizeFormat::Blocks(1024 * 1024)),
+            _ if self.gibis => Some(SizeFormat::Blocks(1024 * 1024 * 1024)),
+            _ => match self.block_size.unwrap_or_else(|| *BLOCK_SIZE) {
+                bs @ (1024 | 512) => Some(SizeFormat::Blocks(bs)),
+                bs if self.apparent_size || self.bytes => Some(SizeFormat::Blocks(bs)),
+                bs => Some(SizeFormat::Blocks(div_round_up(bs, 512))),
+            },
         }
     }
 
-    fn use_apparent_size(&self) -> bool {
-        self.apparent_size || (self.bytes && !self.blocks)
+    fn size_mode(&self) -> SizeMode {
+        if self.no_size || self.inodes {
+            SizeMode::Count
+        } else if self.apparent_size || self.bytes {
+            SizeMode::Apparent
+        } else {
+            SizeMode::DiskSize
+        }
     }
 
     fn with_output<T>(&self, body: impl FnOnce(&dyn Output) -> T) -> T {
         if self.no_progress || !stderr().is_terminal() {
-            return body(&SimpleOutput);
-        }
-
-        let total_count = &AtomicUsize::new(0);
-        thread::scope(|scope| {
-            let (sender, receiver) = channel();
-            scope.spawn(|| ui_thread(total_count, receiver));
-            body(&TerminalOutput {
-                ui_wakeups: sender,
-                total_count,
+            body(&SimpleOutput)
+        } else {
+            let total_count = &AtomicUsize::new(0);
+            thread::scope(|scope| {
+                let (sender, receiver) = channel();
+                scope.spawn(|| ui_thread(total_count, receiver));
+                body(&TerminalOutput {
+                    ui_wakeups: sender,
+                    total_count,
+                })
             })
-        })
+        }
     }
 
-    fn accept(&self, node: &Node, depth: usize) -> bool {
+    fn should_output(&self, node: &Node, depth: usize) -> bool {
         if !self.all && !node.is_dir() {
             return false;
         }
@@ -533,12 +654,35 @@ fn join_strs<const N: usize>(strs: [&str; N]) -> Cow<'_, str> {
     }
 }
 
-enum OutputFormat {
+enum SizeFormat {
     Count,
     Bytes,
     Human,
     SI,
-    Blocks,
+    Blocks(u64),
+}
+
+enum SizeMode {
+    Count,
+    Apparent,
+    DiskSize,
+}
+
+fn file_type_str(file_type: fs::FileType) -> &'static str {
+    match () {
+        _ if file_type.is_file() => "file",
+        _ if file_type.is_dir() => "dir",
+        _ if file_type.is_symlink() => "link",
+        #[cfg(unix)]
+        _ if file_type.is_block_device() => "block",
+        #[cfg(unix)]
+        _ if file_type.is_char_device() => "char",
+        #[cfg(unix)]
+        _ if file_type.is_fifo() => "fifo",
+        #[cfg(unix)]
+        _ if file_type.is_socket() => "socket",
+        _ => "?",
+    }
 }
 
 trait Output: Sync {
@@ -599,7 +743,7 @@ fn ui_thread(total_count: &AtomicUsize, wakups: Receiver<()>) {
 
 const CLEAR_LINE: &str = "\x1B[2K\r";
 
-fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+fn retry_if_interrupted<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     loop {
         let result = f();
         match &result {
@@ -609,8 +753,8 @@ fn retry_if_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T
     }
 }
 
-fn main() -> std::io::Result<()> {
-    let args: DuArgs = DuArgs::parse();
+fn main() -> Result<()> {
+    let args = DuArgs::parse();
 
     ThreadPoolBuilder::new()
         .num_threads(
@@ -618,16 +762,17 @@ fn main() -> std::io::Result<()> {
                 .or_else(|| available_parallelism().ok().map(|x| x.get() * 2))
                 .unwrap_or(0),
         )
+        .use_current_thread()
         .build_global()
         .expect("Failed to set thread pool");
 
     let seen = FxDashSet::default();
-    let roots: Vec<Node> = args.with_output(|output| {
+    let mut roots: Vec<Node> = args.with_output(|output| {
         args.files_or_directories
             .par_iter()
             .with_max_len(1)
             .flat_map_iter(|path| {
-                Node::read(path.into(), &args, output, &seen)
+                Node::read_root(path.into(), &args, output, &seen)
                     .inspect_err(|e| output.log_error(e))
                     .ok()
                     .flatten()
@@ -637,38 +782,48 @@ fn main() -> std::io::Result<()> {
 
     let mut count = roots.iter().map(Node::total_count).sum();
 
-    let mut total = FlatNode {
-        path: "total".into(),
-        size: 0,
-    };
-
     if args.show_total {
         count += 1;
     }
 
     let mut items = Vec::with_capacity(count);
 
-    for root in roots {
-        total.size += root.total_size;
+    if args.tree {
+        // When outputting a tree, sort nodes in the tree first before flattening
+        if args.sort || args.reverse {
+            roots
+                .par_iter_mut()
+                .for_each(|root| root.sort_children(args.no_size, args.reverse));
+        }
 
-        if args.accept(&root, 0) {
-            if args.tree {
-                root.flatten_tree(&mut items, ["", ""], ["", ""], &args, 0);
+        for root in &roots {
+            root.flatten_tree_root(&mut items, &args);
+        }
+    } else {
+        for root in &roots {
+            root.flatten_joined(&mut items, Path::new(""), &args, 0);
+        }
+
+        // When not outputting a tree, sort items after flattening
+        if args.sort || args.reverse {
+            if args.no_size && args.reverse {
+                items.par_sort_unstable_by(|a, b| a.path.cmp(&b.path).reverse());
+            } else if args.no_size {
+                items.par_sort_unstable_by(|a, b| a.path.cmp(&b.path));
+            } else if args.reverse {
+                items.par_sort_unstable_by_key(|x| Reverse(x.size));
             } else {
-                root.flatten_joined(&mut items, Path::new(""), &args, 0);
+                items.par_sort_unstable_by_key(|x| x.size);
             }
         }
     }
 
-    if args.show_total {
-        items.push(total);
-    }
-
-    if !args.tree {
-        if args.reverse {
-            items.par_sort_unstable_by_key(|x| Reverse(x.size));
-        } else if args.sort {
-            items.par_sort_unstable_by_key(|x| x.size);
+    if let Some(mut threshold) = args.threshold {
+        if threshold < 0 {
+            threshold *= -1;
+            items.retain(|node| node.size <= threshold as u64);
+        } else {
+            items.retain(|node| node.size >= threshold as u64);
         }
     }
 
@@ -676,64 +831,71 @@ fn main() -> std::io::Result<()> {
         items.truncate(limit);
     }
 
-    let mut lines = Vec::with_capacity(items.len());
-
-    items
-        .into_par_iter()
-        .map(|item| {
-            let mut buffer = String::with_capacity(item.path.len() + 32);
-            item.format_line(&args, &mut buffer).unwrap();
-            buffer
-        })
-        .collect_into_vec(&mut lines);
-
-    let mut stdout = io::stdout().lock();
-    for line in lines {
-        let result = stdout.write_all(line.as_bytes());
-        // Ignore broken pipe from e.g. pipe into less
-        match result {
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
-            x => x?,
-        }
+    if args.show_total {
+        items.push(FlatNode {
+            path: "total".into(),
+            size: roots.iter().map(Node::total_size).sum(),
+            file_type: None,
+        });
     }
 
-    Ok(())
+    let mut output = String::with_capacity(items.iter().map(|item| item.path.len() + 48).sum());
+
+    for item in &items {
+        item.format_line(&args, &mut output).unwrap();
+    }
+
+    std::io::stdout().lock().write_all(output.as_bytes())
+}
+
+fn div_round_up(size: u64, block_size: u64) -> u64 {
+    let div = size / block_size;
+    let rem = size % block_size;
+    if rem == 0 { div } else { div + 1 }
 }
 
 impl FlatNode {
-    fn format_line(&self, args: &DuArgs, out: &mut dyn Write) -> fmt::Result {
-        let format = args.output_format();
-        let newline = if args.null { '\0' } else { '\n' };
+    fn format_line(&self, args: &DuArgs, out: &mut dyn fmt::Write) -> fmt::Result {
         let size = self.size;
-        let blocks = size / 512;
+        let newline = if args.null { "\0" } else { "\n" };
+        let sep = if args.du_compatible { "\t" } else { "  " };
 
-        if args.du_compatible {
-            match format {
-                OutputFormat::Count => write!(out, "{size}"),
-                OutputFormat::Bytes => write!(out, "{size}"),
-                OutputFormat::Human => format_size(size, true, true, out),
-                OutputFormat::SI => format_size(size, false, true, out),
-                OutputFormat::Blocks => write!(out, "{blocks}"),
+        if let Some(format) = args.size_format() {
+            if args.du_compatible {
+                match format {
+                    SizeFormat::Count => write!(out, "{size}")?,
+                    SizeFormat::Bytes => write!(out, "{size}")?,
+                    SizeFormat::Human => format_size(size, true, true, out)?,
+                    SizeFormat::SI => format_size(size, false, true, out)?,
+                    SizeFormat::Blocks(bs) => write!(out, "{}", div_round_up(size, bs))?,
+                }
+            } else {
+                match format {
+                    SizeFormat::Count => write!(out, "{size:>16} inodes")?,
+                    SizeFormat::Bytes => write!(out, "{size:>16} bytes")?,
+                    SizeFormat::Human => format_size(size, true, false, out)?,
+                    SizeFormat::SI => format_size(size, false, false, out)?,
+                    SizeFormat::Blocks(bs) => write!(out, "{:>12} blocks", div_round_up(size, bs))?,
+                }
             }
-        } else {
-            match format {
-                OutputFormat::Count => write!(out, "{size:>16} inodes"),
-                OutputFormat::Bytes => write!(out, "{size:>16} bytes"),
-                OutputFormat::Human => format_size(size, true, false, out),
-                OutputFormat::SI => format_size(size, false, false, out),
-                OutputFormat::Blocks => write!(out, "{blocks:>16} blocks"),
-            }
-        }?;
-
-        if args.du_compatible {
-            write!(out, "\t{}{newline}", self.path)
-        } else {
-            write!(out, "  {}{newline}", self.path)
+            write!(out, "{}", sep)?;
         }
+
+        if args.show_type {
+            let ft = self.file_type.map(file_type_str).unwrap_or("");
+            write!(out, "{ft:<4}{sep}")?;
+        }
+
+        write!(out, "{}{newline}", self.path)
     }
 }
 
-fn format_size(bytes: u64, binary: bool, du_compatible: bool, out: &mut dyn Write) -> fmt::Result {
+fn format_size(
+    bytes: u64,
+    binary: bool,
+    du_compatible: bool,
+    out: &mut dyn fmt::Write,
+) -> fmt::Result {
     let mut factor: u64 = 1;
     let mut power = 0;
     let mut result = bytes;
