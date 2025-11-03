@@ -1,6 +1,7 @@
 use clap::ArgAction;
 use clap::Parser;
 use dashmap::DashSet;
+use mimalloc::MiMalloc;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
@@ -22,6 +23,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
 use std::{thread, u64};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug)]
 struct Node {
