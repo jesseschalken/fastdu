@@ -6,20 +6,15 @@ use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::borrow::Cow;
-use std::cell::LazyCell;
 use std::cmp::Reverse;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Debug;
-use std::fs;
 use std::fs::Metadata;
-use std::fs::read_link;
 use std::io::Write;
 use std::io::{self, IsTerminal, Result, stderr};
-#[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -39,19 +34,15 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[derive(Debug)]
 struct Node {
     name: Box<OsStr>,
-    /// Always 1 if counting inodes
-    self_size: u64,
-    children_size: u64,
-    file_type: fs::FileType,
-    children: Box<[Node]>,
-    link_contents: Option<Box<Path>>,
+    size: u64,
+    // None for files, Some for directories
+    children: Option<Box<[Node]>>,
 }
 
 #[derive(Debug)]
 struct FlatNode {
     size: u64,
     path: Box<str>,
-    file_type: Option<fs::FileType>,
 }
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
@@ -121,26 +112,21 @@ impl Node {
         let name = self.name.to_string_lossy();
         let children = self
             .children
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
             .filter(|child| args.should_output(child, depth + 1))
             .collect::<Vec<_>>();
 
-        let mut path: String = match (self_prefix, &*children) {
-            (["", ""], []) => join_strs(["· ", &name]),
-            (["", ""], _) => join_strs(["╷ ", &name]),
-            ([a, b], []) => join_strs([a, b, "╴ ", &name]),
-            ([a, b], _) => join_strs([a, b, "╮ ", &name]),
-        }
-        .into();
-
-        if let Some(link_contents) = &self.link_contents {
-            path = join_strs([&path, " → ", &link_contents.to_string_lossy()]).into();
-        }
-
         output.push(FlatNode {
-            size: self.total_size(),
-            path: path.into(),
-            file_type: Some(self.file_type),
+            size: self.size,
+            path: match (self_prefix, &*children) {
+                (["", ""], []) => join_strs(["· ", &name]),
+                (["", ""], _) => join_strs(["╷ ", &name]),
+                ([a, b], []) => join_strs([a, b, "╴ ", &name]),
+                ([a, b], _) => join_strs([a, b, "╮ ", &name]),
+            }
+            .into(),
         });
 
         if let [children @ .., last_child] = &*children {
@@ -167,20 +153,19 @@ impl Node {
 
         let path = fast_path_join(parent_path, &self.name);
 
-        for child in &self.children {
+        for child in self.children.as_deref().unwrap_or(&[]) {
             child.flatten_joined(output, &path, args, depth + 1);
         }
 
         output.push(FlatNode {
             path: os_string_into_string_lossy(path.into()).into(),
-            size: self.children_size,
-            file_type: Some(self.file_type),
+            size: self.size,
         });
     }
 
     fn total_count(&self) -> usize {
         let mut total = 1;
-        for node in &self.children {
+        for node in self.children.as_deref().unwrap_or(&[]) {
             total += node.total_count();
         }
         total
@@ -202,43 +187,36 @@ impl Node {
             .map_err(|e| add_context(e, path))?
             .map(|result| -> Result<_> {
                 let entry = result.as_ref().map_err(|e| add_context(e, path))?;
-                let metadata = LazyCell::new(|| {
-                    if args.dereference_all {
-                        entry.path().metadata()
-                    } else {
-                        entry.metadata()
-                    }
-                });
-                let metadata = || metadata.as_ref().map_err(|e| add_context(e, &entry.path()));
-                let inode = || metadata().map(InodeKey::create);
+                let metadata = if args.dereference_all {
+                    entry.path().metadata()
+                } else {
+                    entry.metadata()
+                };
+                let metadata = metadata
+                    .as_ref()
+                    .map_err(|e| add_context(e, &entry.path()))?;
+                let inode = InodeKey::create(metadata);
 
-                if args.one_file_system && inode()?.dev != root.dev {
+                if args.one_file_system && inode.dev != root.dev {
                     return Ok(None);
                 }
 
-                if cfg!(unix) && !args.count_links && !seen.insert(inode()?) {
+                if cfg!(unix) && !args.count_links && !seen.insert(inode) {
                     return Ok(None);
                 }
-
-                let file_type = entry
-                    .file_type()
-                    .map_err(|e| add_context(&e, &entry.path()))?;
 
                 Ok(Some(Node {
                     name: entry.file_name().into(),
-                    self_size: match args.size_mode() {
+                    size: match args.size_mode() {
                         SizeMode::Count => 1,
-                        SizeMode::DiskSize => get_disk_size(metadata()?),
-                        SizeMode::Apparent => metadata()?.len(),
+                        SizeMode::DiskSize => get_disk_size(metadata),
+                        SizeMode::Apparent => metadata.len(),
                     },
-                    children_size: 0,
-                    file_type,
-                    link_contents: if args.tree && file_type.is_symlink() {
-                        Some(read_link(&entry.path())?.into())
+                    children: if metadata.is_dir() {
+                        Some(Box::new([]))
                     } else {
                         None
                     },
-                    children: Default::default(),
                 }))
             })
             .flat_map(|result| result.inspect_err(|e| output.log_error(e)))
@@ -255,12 +233,12 @@ impl Node {
             .with_max_len(1)
             .for_each(|node| {
                 let path = fast_path_join(path, &node.name);
-
-                node.children = Node::read_children(&path, args, root, output, seen)
+                let children = Node::read_children(&path, args, root, output, seen)
                     .inspect_err(|e| output.log_error(e))
                     .unwrap_or_default();
 
-                node.update_children_size();
+                node.size += children.iter().map(|x| x.size).sum::<u64>();
+                node.children = Some(children);
             });
 
         Ok(nodes)
@@ -278,39 +256,27 @@ impl Node {
             path.symlink_metadata()
         };
         let metadata = metadata.as_ref().map_err(|e| add_context(e, &path))?;
-
         let inode = InodeKey::create(metadata);
 
         if cfg!(unix) && !seen.insert(inode) {
             return Ok(None);
         }
 
-        let file_type = metadata.file_type();
-        let link_contents = if args.tree && file_type.is_symlink() {
-            Some(read_link(&path)?.into())
-        } else {
-            None
-        };
-        let children = if file_type.is_dir() {
-            Node::read_children(&path, args, &inode, output, seen)?
-        } else {
-            Default::default()
-        };
-
         let mut node = Node {
             name: OsString::from(path).into(),
-            self_size: match args.size_mode() {
+            size: match args.size_mode() {
                 SizeMode::Count => 1,
                 SizeMode::DiskSize => get_disk_size(metadata),
                 SizeMode::Apparent => metadata.len(),
             },
-            children_size: 0,
-            file_type,
-            children,
-            link_contents,
+            children: None,
         };
 
-        node.update_children_size();
+        if metadata.is_dir() {
+            let children = Node::read_children(Path::new(&node.name), args, &inode, output, seen)?;
+            node.size += children.iter().map(|x| x.size).sum::<u64>();
+            node.children = Some(children);
+        };
 
         output.add_total(1);
 
@@ -318,33 +284,25 @@ impl Node {
     }
 
     fn is_dir(&self) -> bool {
-        self.file_type.is_dir()
-    }
-
-    fn update_children_size(&mut self) {
-        self.children_size = self.children.iter().map(Node::total_size).sum();
+        self.children.is_some()
     }
 
     fn sort_children(&mut self, no_size: bool, reverse: bool) {
-        let children = &mut self.children;
+        let children = self.children.as_deref_mut().unwrap_or(&mut []);
 
         if no_size && reverse {
             children.par_sort_unstable_by(|a, b| a.name.cmp(&b.name).reverse());
         } else if no_size {
             children.par_sort_unstable_by(|a, b| a.name.cmp(&b.name));
         } else if reverse {
-            children.par_sort_unstable_by_key(|x| Reverse(x.total_size()));
+            children.par_sort_unstable_by_key(|x| Reverse(x.size));
         } else {
-            children.par_sort_unstable_by_key(|x| x.total_size());
+            children.par_sort_unstable_by_key(|x| x.size);
         }
 
         children
             .par_iter_mut()
             .for_each(|child| child.sort_children(no_size, reverse));
-    }
-
-    fn total_size(&self) -> u64 {
-        self.self_size + self.children_size
     }
 }
 
@@ -519,9 +477,6 @@ struct DuArgs {
     )]
     no_size: bool,
 
-    #[arg(short = 'f', long = "type", help = "Show file type of each entry")]
-    show_type: bool,
-
     #[arg(
         short = 'T',
         long = "tree",
@@ -666,23 +621,6 @@ enum SizeMode {
     Count,
     Apparent,
     DiskSize,
-}
-
-fn file_type_str(file_type: fs::FileType) -> &'static str {
-    match () {
-        _ if file_type.is_file() => "file",
-        _ if file_type.is_dir() => "dir",
-        _ if file_type.is_symlink() => "link",
-        #[cfg(unix)]
-        _ if file_type.is_block_device() => "block",
-        #[cfg(unix)]
-        _ if file_type.is_char_device() => "char",
-        #[cfg(unix)]
-        _ if file_type.is_fifo() => "fifo",
-        #[cfg(unix)]
-        _ if file_type.is_socket() => "socket",
-        _ => "?",
-    }
 }
 
 trait Output: Sync {
@@ -834,8 +772,7 @@ fn main() -> Result<()> {
     if args.show_total {
         items.push(FlatNode {
             path: "total".into(),
-            size: roots.iter().map(Node::total_size).sum(),
-            file_type: None,
+            size: roots.iter().map(|x| x.size).sum(),
         });
     }
 
@@ -879,11 +816,6 @@ impl FlatNode {
                 }
             }
             write!(out, "{}", sep)?;
-        }
-
-        if args.show_type {
-            let ft = self.file_type.map(file_type_str).unwrap_or("");
-            write!(out, "{ft:<4}{sep}")?;
         }
 
         write!(out, "{}{newline}", self.path)
