@@ -13,6 +13,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Debug;
+use std::fs::DirEntry;
 use std::fs::Metadata;
 use std::fs::read_link;
 use std::io::Write;
@@ -173,141 +174,164 @@ impl Node {
         total
     }
 
-    fn read_children(
+    fn assign_children(
+        &mut self,
         path: &Path,
         args: &DuArgs,
-        root: &InodeKey,
+        root: Option<InodeKey>,
         output: &dyn Output,
         seen: &FxDashSet<InodeKey>,
-    ) -> Result<Box<[Node]>> {
-        // Build nodes before recursing on subdirectories so we close the
-        // directory handle and don't get a "Too many open files" error.
+    ) -> Result<()> {
+        // If we are a directory with no children, try to read them from disk
+        if let Some([]) = self.children.as_deref() {
+            // Build nodes before recursing on subdirectories so we close the
+            // directory handle and don't get a "Too many open files" error.
 
-        // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
-        let mut nodes = retry_if_interrupted(|| path.read_dir())
-            .as_mut()
-            .map_err(|e| add_context(e, path))?
-            .map(|result| -> Result<_> {
-                let entry = result.as_ref().map_err(|e| add_context(e, path))?;
-                let path = LazyCell::new(|| entry.path());
+            // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
+            let mut nodes: Vec<Node> = retry_if_interrupted(|| path.read_dir())
+                .as_mut()
+                .map_err(|e| add_context(e, &path))?
+                .flat_map(|entry| {
+                    entry
+                        .as_ref()
+                        .map_err(|e| add_context(e, &path))
+                        .and_then(|entry| {
+                            Node::read(None, Some(entry), args, seen, &mut root.clone())
+                        })
+                        .inspect_err(|e| output.log_error(e))
+                })
+                .flatten()
+                .collect();
 
-                // We don't need metadata with -lz or -li and no -x, so load it as needed.
-                let metadata = LazyCell::new(|| {
-                    if args.dereference_all {
-                        path.metadata()
-                    } else {
-                        entry.metadata()
-                    }
+            output.add_total(nodes.len());
+
+            nodes
+                .iter_mut()
+                .filter(|node| node.is_dir())
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .with_max_len(1)
+                .for_each(|node| {
+                    let path = fast_path_join(path, &node.name);
+                    node.assign_children(&path, args, root, output, seen)
+                        .inspect_err(|e| output.log_error(e))
+                        .unwrap_or(());
                 });
-                let metadata = || metadata.as_ref().map_err(|e| add_context(e, &path));
-                let inode = || metadata().map(InodeKey::create);
 
-                if args.one_file_system && inode()?.dev != root.dev {
+            self.size += nodes.iter().map(|x| x.size).sum::<u64>();
+            self.children = Some(nodes.into());
+        }
+
+        Ok(())
+    }
+
+    fn read(
+        path: Option<&Path>,
+        entry: Option<&DirEntry>,
+        args: &DuArgs,
+        seen: &FxDashSet<InodeKey>,
+        root: &mut Option<InodeKey>,
+    ) -> Result<Option<Node>> {
+        let is_root = entry.is_none();
+        let dereference = args.dereference_all || (is_root && args.dereference_args);
+
+        // We don't always need the full path, and it costs to create it from a DirEntry so do so lazily
+        let path = LazyCell::new(|| -> Cow<'_, Path> {
+            if let Some(path) = path {
+                path.into()
+            } else if let Some(entry) = entry {
+                entry.path().into()
+            } else {
+                unreachable!("Either a Path or DirEntry must be provided")
+            }
+        });
+
+        // We don't need metadata with -lz or -li and no -x, so load it as needed.
+        let metadata = LazyCell::new(|| {
+            if dereference {
+                path.metadata()
+            } else if let Some(entry) = entry {
+                entry.metadata()
+            } else {
+                path.symlink_metadata()
+            }
+        });
+
+        let metadata = || metadata.as_ref().map_err(|e| add_context(e, &path));
+        let inode = || metadata().map(InodeKey::create);
+
+        if args.one_file_system {
+            if let Some(root) = root {
+                if inode()?.dev != root.dev {
                     return Ok(None);
                 }
+            } else {
+                *root = Some(inode()?)
+            }
+        }
 
-                if cfg!(unix) && !args.count_links && !seen.insert(inode()?) {
-                    return Ok(None);
-                }
+        if cfg!(unix) && !args.count_links && !seen.insert(inode()?) {
+            return Ok(None);
+        }
 
-                let file_type = if args.dereference_all {
-                    metadata()?.file_type()
-                } else {
-                    // In theory this could do an lstat() again, but only on some obscure
-                    // platforms or for some obscure file types.
-                    entry.file_type().map_err(|e| add_context(&e, &path))?
-                };
+        let file_type = if !dereference && let Some(entry) = entry {
+            // In theory this could do an lstat() again, but only on some obscure
+            // platforms or for some obscure file types.
+            entry.file_type().map_err(|e| add_context(&e, &path))?
+        } else {
+            metadata()?.file_type()
+        };
 
-                let mut name = entry.file_name();
+        let mut name: OsString = if let Some(entry) = entry {
+            entry.file_name()
+        } else {
+            path.clone().into_owned().into()
+        };
 
-                // When outputting a tree, append symlink targets to names
-                if args.tree && file_type.is_symlink() {
-                    let sep = " → ";
-                    let contents: OsString = read_link(&*path)
-                        .map_err(|e| add_context(&e, &path))?
-                        .into();
+        // When outputting a tree, append symlink targets to names
+        if args.tree && file_type.is_symlink() {
+            let sep = " → ";
+            let contents: OsString = read_link(&*path)
+                .map_err(|e| add_context(&e, &path))?
+                .into();
 
-                    name.reserve_exact(sep.len() + contents.len());
-                    name.push(sep);
-                    name.push(contents);
-                }
+            name.reserve_exact(sep.len() + contents.len());
+            name.push(sep);
+            name.push(contents);
+        }
 
-                Ok(Some(Node {
-                    name: name.into(),
-                    size: match args.size_mode() {
-                        SizeMode::Count => 1,
-                        SizeMode::DiskSize => get_disk_size(metadata()?),
-                        SizeMode::Apparent => metadata()?.len(),
-                    },
-                    children: if file_type.is_dir() {
-                        Some(Box::new([]))
-                    } else {
-                        None
-                    },
-                }))
-            })
-            .flat_map(|result| result.inspect_err(|e| output.log_error(e)))
-            .flatten()
-            .collect::<Box<_>>();
-
-        output.add_total(nodes.len());
-
-        nodes
-            .iter_mut()
-            .filter(|node| node.is_dir())
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .with_max_len(1)
-            .for_each(|node| {
-                let path = fast_path_join(path, &node.name);
-                let children = Node::read_children(&path, args, root, output, seen)
-                    .inspect_err(|e| output.log_error(e))
-                    .unwrap_or_default();
-
-                node.size += children.iter().map(|x| x.size).sum::<u64>();
-                node.children = Some(children);
-            });
-
-        Ok(nodes)
+        Ok(Some(Node {
+            name: name.into(),
+            size: if args.no_size || args.inodes {
+                1
+            } else if args.apparent_size || args.bytes {
+                metadata()?.len()
+            } else {
+                get_disk_size(metadata()?)
+            },
+            children: if file_type.is_dir() {
+                Some(Box::new([]))
+            } else {
+                None
+            },
+        }))
     }
 
     fn read_root(
-        path: PathBuf,
+        path: &Path,
         args: &DuArgs,
         output: &dyn Output,
         seen: &FxDashSet<InodeKey>,
     ) -> Result<Option<Node>> {
-        let metadata = if args.dereference_args || args.dereference_all {
-            path.metadata()
-        } else {
-            path.symlink_metadata()
-        };
-        let metadata = metadata.as_ref().map_err(|e| add_context(e, &path))?;
-        let inode = InodeKey::create(metadata);
+        let mut root = None;
+        let mut node = Node::read(Some(path), None, args, seen, &mut root)?;
 
-        if cfg!(unix) && !seen.insert(inode) {
-            return Ok(None);
+        if let Some(node) = &mut node {
+            node.assign_children(&path, args, root, output, seen)?;
+            output.add_total(1);
         }
 
-        let mut node = Node {
-            name: OsString::from(path).into(),
-            size: match args.size_mode() {
-                SizeMode::Count => 1,
-                SizeMode::DiskSize => get_disk_size(metadata),
-                SizeMode::Apparent => metadata.len(),
-            },
-            children: None,
-        };
-
-        if metadata.is_dir() {
-            let children = Node::read_children(Path::new(&node.name), args, &inode, output, seen)?;
-            node.size += children.iter().map(|x| x.size).sum::<u64>();
-            node.children = Some(children);
-        };
-
-        output.add_total(1);
-
-        Ok(Some(node))
+        Ok(node)
     }
 
     fn is_dir(&self) -> bool {
@@ -577,16 +601,6 @@ impl DuArgs {
         }
     }
 
-    fn size_mode(&self) -> SizeMode {
-        if self.no_size || self.inodes {
-            SizeMode::Count
-        } else if self.apparent_size || self.bytes {
-            SizeMode::Apparent
-        } else {
-            SizeMode::DiskSize
-        }
-    }
-
     fn with_output<T>(&self, body: impl FnOnce(&dyn Output) -> T) -> T {
         if self.no_progress || !stderr().is_terminal() {
             body(&SimpleOutput)
@@ -642,12 +656,6 @@ enum SizeFormat {
     Human,
     SI,
     Blocks(u64),
-}
-
-enum SizeMode {
-    Count,
-    Apparent,
-    DiskSize,
 }
 
 trait Output: Sync {
@@ -737,7 +745,7 @@ fn main() -> Result<()> {
             .par_iter()
             .with_max_len(1)
             .flat_map_iter(|path| {
-                Node::read_root(path.into(), &args, output, &seen)
+                Node::read_root(path.as_ref(), &args, output, &seen)
                     .inspect_err(|e| output.log_error(e))
                     .ok()
                     .flatten()
