@@ -6,6 +6,7 @@ use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::borrow::Cow;
+use std::cell::LazyCell;
 use std::cmp::Reverse;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -13,6 +14,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Debug;
 use std::fs::Metadata;
+use std::fs::read_link;
 use std::io::Write;
 use std::io::{self, IsTerminal, Result, stderr};
 #[cfg(unix)]
@@ -187,32 +189,57 @@ impl Node {
             .map_err(|e| add_context(e, path))?
             .map(|result| -> Result<_> {
                 let entry = result.as_ref().map_err(|e| add_context(e, path))?;
-                let metadata = if args.dereference_all {
-                    entry.path().metadata()
-                } else {
-                    entry.metadata()
-                };
-                let metadata = metadata
-                    .as_ref()
-                    .map_err(|e| add_context(e, &entry.path()))?;
-                let inode = InodeKey::create(metadata);
+                let path = LazyCell::new(|| entry.path());
 
-                if args.one_file_system && inode.dev != root.dev {
+                // We don't need metadata with -lz or -li and no -x, so load it as needed.
+                let metadata = LazyCell::new(|| {
+                    if args.dereference_all {
+                        path.metadata()
+                    } else {
+                        entry.metadata()
+                    }
+                });
+                let metadata = || metadata.as_ref().map_err(|e| add_context(e, &path));
+                let inode = || metadata().map(InodeKey::create);
+
+                if args.one_file_system && inode()?.dev != root.dev {
                     return Ok(None);
                 }
 
-                if cfg!(unix) && !args.count_links && !seen.insert(inode) {
+                if cfg!(unix) && !args.count_links && !seen.insert(inode()?) {
                     return Ok(None);
+                }
+
+                let file_type = if args.dereference_all {
+                    metadata()?.file_type()
+                } else {
+                    // In theory this could do an lstat() again, but only on some obscure
+                    // platforms or for some obscure file types.
+                    entry.file_type().map_err(|e| add_context(&e, &path))?
+                };
+
+                let mut name = entry.file_name();
+
+                // When outputting a tree, append symlink targets to names
+                if args.tree && file_type.is_symlink() {
+                    let sep = " → ";
+                    let contents: OsString = read_link(&*path)
+                        .map_err(|e| add_context(&e, &path))?
+                        .into();
+
+                    name.reserve_exact(sep.len() + contents.len());
+                    name.push(sep);
+                    name.push(contents);
                 }
 
                 Ok(Some(Node {
-                    name: entry.file_name().into(),
+                    name: name.into(),
                     size: match args.size_mode() {
                         SizeMode::Count => 1,
-                        SizeMode::DiskSize => get_disk_size(metadata),
-                        SizeMode::Apparent => metadata.len(),
+                        SizeMode::DiskSize => get_disk_size(metadata()?),
+                        SizeMode::Apparent => metadata()?.len(),
                     },
-                    children: if metadata.is_dir() {
+                    children: if file_type.is_dir() {
                         Some(Box::new([]))
                     } else {
                         None
