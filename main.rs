@@ -564,11 +564,17 @@ struct DuArgs {
     #[arg(
         short = 'd',
         long = "max-depth",
-        help = "Only show entries up to this maximum depth"
+        help = "Only show entries up to this maximum depth",
+        group = "depth"
     )]
     max_depth: Option<usize>,
 
-    #[arg(short = 's', long = "summarize", help = "Same as --max-depth=0")]
+    #[arg(
+        short = 's',
+        long = "summarize",
+        help = "Same as --max-depth=0",
+        group = "depth"
+    )]
     summarize: bool,
 
     #[arg(short = 'c', long = "total", help = "Include a grand total")]
@@ -618,21 +624,9 @@ impl DuArgs {
     }
 
     fn should_output(&self, node: &Node, depth: usize) -> bool {
-        if !self.all && !node.is_dir() {
-            return false;
-        }
-
-        if depth > 0 && self.summarize {
-            return false;
-        }
-
-        if let Some(max_depth) = self.max_depth {
-            if depth > max_depth {
-                return false;
-            }
-        }
-
-        return true;
+        (self.all || node.is_dir())
+            && (!self.summarize || depth == 0)
+            && (self.max_depth.map_or(true, |max_depth| depth <= max_depth))
     }
 }
 
