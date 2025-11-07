@@ -178,7 +178,7 @@ impl Node {
         &mut self,
         path: &Path,
         args: &DuArgs,
-        root: Option<InodeKey>,
+        mut root: Option<InodeKey>,
         output: &dyn Output,
         seen: &FxDashSet<InodeKey>,
     ) -> Result<()> {
@@ -195,9 +195,7 @@ impl Node {
                     entry
                         .as_ref()
                         .map_err(|e| add_context(e, &path))
-                        .and_then(|entry| {
-                            Node::read(None, Some(entry), args, seen, &mut root.clone())
-                        })
+                        .and_then(|entry| Node::read(None, Some(entry), args, seen, &mut root))
                         .inspect_err(|e| output.log_error(e))
                 })
                 .flatten()
@@ -274,12 +272,13 @@ impl Node {
             return Ok(None);
         }
 
-        let file_type = if !dereference && let Some(entry) = entry {
-            // In theory this could do an lstat() again, but only on some obscure
-            // platforms or for some obscure file types.
-            entry.file_type().map_err(|e| add_context(&e, &path))?
-        } else {
-            metadata()?.file_type()
+        let file_type = match entry {
+            Some(entry) if !dereference => {
+                // In theory this could do an lstat() again, but only on some obscure
+                // platforms or for some obscure file types.
+                entry.file_type().map_err(|e| add_context(&e, &path))?
+            }
+            _ => metadata()?.file_type(),
         };
 
         let mut name: OsString = if let Some(entry) = entry {
