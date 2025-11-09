@@ -350,7 +350,7 @@ impl Node {
             NodeContent::File
         } else if file_type.is_dir() {
             NodeContent::Directory(Box::new([]))
-        } else if file_type.is_symlink() {
+        } else if file_type.is_symlink() && args.tree {
             NodeContent::Symlink(
                 read_link(&*path)
                     .map_err(|e| add_context(&e, &path))?
