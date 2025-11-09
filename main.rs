@@ -9,14 +9,14 @@ use std::borrow::Cow;
 use std::cell::LazyCell;
 use std::cmp::Reverse;
 use std::error::Error;
-use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Debug;
+use std::fmt::Write;
 use std::fs::DirEntry;
 use std::fs::Metadata;
 use std::fs::read_link;
-use std::io::Write;
+use std::io::Write as _;
 use std::io::{self, IsTerminal, Result, stderr};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -31,21 +31,71 @@ use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
 use std::{thread, u64};
 
+/// A simple [`u128`] acting like a [`Vec<bool>`]
+#[derive(Copy, Clone, Default)]
+struct BoolsVec128 {
+    val: u128,
+    len: u8,
+}
+
+impl BoolsVec128 {
+    fn push(&mut self, value: bool) {
+        self.set(self.len, value);
+        self.len += 1;
+    }
+    fn pop(&mut self) -> Option<bool> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(self.get(self.len))
+    }
+    fn get(&self, index: u8) -> bool {
+        (self.val & (1 << index)) != 0
+    }
+    fn set(&mut self, index: u8, value: bool) {
+        if value {
+            self.val |= 1 << index;
+        } else {
+            self.val &= !(1 << index);
+        }
+    }
+    fn join(mut self, value: bool) -> Self {
+        self.push(value);
+        self
+    }
+}
+
+impl Extend<bool> for BoolsVec128 {
+    fn extend<T: IntoIterator<Item = bool>>(&mut self, iter: T) {
+        for x in iter {
+            self.push(x)
+        }
+    }
+}
+
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[derive(Debug)]
 struct Node {
-    name: Box<OsStr>,
+    name: Box<Path>,
     size: u64,
-    // None for files, Some for directories
-    children: Option<Box<[Node]>>,
+    content: NodeContent,
 }
 
-#[derive(Debug)]
+enum NodeContent {
+    Directory(Box<[Node]>),
+    Symlink(Box<Path>),
+    File,
+    Other,
+}
+
 struct FlatNode {
     size: u64,
-    path: Box<str>,
+    anscestor_is_last: BoolsVec128,
+    has_children: bool,
+    path: Box<Path>,
+    target: Option<Box<Path>>,
 }
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
@@ -66,11 +116,6 @@ impl InodeKey {
         #[cfg(not(unix))]
         return Self { ino: 0, dev: 0 };
     }
-}
-
-fn os_string_into_string_lossy(s: OsString) -> String {
-    s.into_string()
-        .unwrap_or_else(|s| s.to_string_lossy().into_owned())
 }
 
 type FxDashSet<T> = DashSet<T, FxBuildHasher>;
@@ -98,53 +143,52 @@ static BLOCK_SIZE: LazyLock<u64> = LazyLock::new(|| {
 });
 
 impl Node {
-    fn flatten_tree_root(&self, output: &mut Vec<FlatNode>, args: &DuArgs) {
-        if args.should_output(self, 0) {
-            self.flatten_tree(output, ["", ""], ["", ""], args, 0);
+    fn flatten_tree_root(self, output: &mut Vec<FlatNode>, args: &DuArgs) {
+        if args.should_output(&self, 0) {
+            self.flatten_tree(output, BoolsVec128::default(), args, 0);
         }
     }
 
     fn flatten_tree(
-        &self,
+        self,
         output: &mut Vec<FlatNode>,
-        self_prefix: [&str; 2],
-        child_prefix: [&str; 2],
+        anscestor_is_last: BoolsVec128,
         args: &DuArgs,
         depth: usize,
     ) {
-        let name = self.name.to_string_lossy();
-        let children = self
-            .children
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|child| args.should_output(child, depth + 1))
-            .collect::<Vec<_>>();
+        let mut children = Vec::new();
+        let mut target = None;
+
+        match self.content {
+            NodeContent::Directory(x) => {
+                children = x
+                    .into_iter()
+                    .filter(|child| args.should_output(child, depth + 1))
+                    .collect()
+            }
+            NodeContent::Symlink(x) => target = Some(x),
+            _ => {}
+        };
 
         output.push(FlatNode {
+            anscestor_is_last,
             size: self.size,
-            path: match (self_prefix, &*children) {
-                (["", ""], []) => join_strs(["· ", &name]),
-                (["", ""], _) => join_strs(["╷ ", &name]),
-                ([a, b], []) => join_strs([a, b, "╴ ", &name]),
-                ([a, b], _) => join_strs([a, b, "╮ ", &name]),
-            }
-            .into(),
+            path: self.name,
+            has_children: !children.is_empty(),
+            target,
         });
 
-        if let [children @ .., last_child] = &*children {
-            let prefix = join_strs(child_prefix);
-
+        if let Some(last_child) = children.pop() {
             for child in children {
-                child.flatten_tree(output, [&prefix, "├─"], [&prefix, "│ "], args, depth + 1);
+                child.flatten_tree(output, anscestor_is_last.join(false), args, depth + 1);
             }
 
-            last_child.flatten_tree(output, [&prefix, "╰─"], [&prefix, "  "], args, depth + 1);
+            last_child.flatten_tree(output, anscestor_is_last.join(true), args, depth + 1);
         }
     }
 
     fn flatten_joined(
-        &self,
+        self,
         output: &mut Vec<FlatNode>,
         parent_path: &Path,
         args: &DuArgs,
@@ -155,23 +199,34 @@ impl Node {
         }
 
         let path = fast_path_join(parent_path, &self.name);
+        let mut target = None;
+        let mut has_children = false;
 
-        for child in self.children.as_deref().unwrap_or(&[]) {
-            child.flatten_joined(output, &path, args, depth + 1);
+        match self.content {
+            NodeContent::Directory(children) => {
+                has_children = !children.is_empty();
+                for child in children {
+                    child.flatten_joined(output, &path, args, depth + 1);
+                }
+            }
+            NodeContent::Symlink(x) => target = Some(x),
+            _ => {}
         }
 
         output.push(FlatNode {
-            path: os_string_into_string_lossy(path.into()).into(),
+            path: path.into(),
             size: self.size,
+            has_children,
+            anscestor_is_last: Default::default(),
+            target,
         });
     }
 
     fn total_count(&self) -> usize {
-        let mut total = 1;
-        for node in self.children.as_deref().unwrap_or(&[]) {
-            total += node.total_count();
+        1 + match &self.content {
+            NodeContent::Directory(children) => children.iter().map(Node::total_count).sum(),
+            _ => 0,
         }
-        total
     }
 
     fn assign_children(
@@ -183,7 +238,11 @@ impl Node {
         seen: &FxDashSet<InodeKey>,
     ) -> Result<()> {
         // If we are a directory with no children, try to read them from disk
-        if let Some([]) = self.children.as_deref() {
+        if let NodeContent::Directory(children) = &mut self.content {
+            if !children.is_empty() {
+                return Ok(());
+            }
+
             // Build nodes before recursing on subdirectories so we close the
             // directory handle and don't get a "Too many open files" error.
 
@@ -216,8 +275,8 @@ impl Node {
                         .unwrap_or(());
                 });
 
-            self.size += nodes.iter().map(|x| x.size).sum::<u64>();
-            self.children = Some(nodes.into());
+            *children = nodes.into();
+            self.size += children.iter().map(|x| x.size).sum::<u64>();
         }
 
         Ok(())
@@ -281,23 +340,25 @@ impl Node {
             _ => metadata()?.file_type(),
         };
 
-        let mut name: OsString = if let Some(entry) = entry {
-            entry.file_name()
+        let name: PathBuf = if let Some(entry) = entry {
+            entry.file_name().into()
         } else {
-            path.clone().into_owned().into()
+            path.clone().into_owned()
         };
 
-        // When outputting a tree, append symlink targets to names
-        if args.tree && file_type.is_symlink() {
-            let sep = " → ";
-            let contents: OsString = read_link(&*path)
-                .map_err(|e| add_context(&e, &path))?
-                .into();
-
-            name.reserve_exact(sep.len() + contents.len());
-            name.push(sep);
-            name.push(contents);
-        }
+        let content = if file_type.is_file() {
+            NodeContent::File
+        } else if file_type.is_dir() {
+            NodeContent::Directory(Box::new([]))
+        } else if file_type.is_symlink() {
+            NodeContent::Symlink(
+                read_link(&*path)
+                    .map_err(|e| add_context(&e, &path))?
+                    .into(),
+            )
+        } else {
+            NodeContent::Other
+        };
 
         Ok(Some(Node {
             name: name.into(),
@@ -308,11 +369,7 @@ impl Node {
             } else {
                 get_disk_size(metadata()?)
             },
-            children: if file_type.is_dir() {
-                Some(Box::new([]))
-            } else {
-                None
-            },
+            content,
         }))
     }
 
@@ -334,11 +391,16 @@ impl Node {
     }
 
     fn is_dir(&self) -> bool {
-        self.children.is_some()
+        match self.content {
+            NodeContent::Directory(_) => true,
+            _ => false,
+        }
     }
 
     fn sort_children(&mut self, no_size: bool, reverse: bool) {
-        let children = self.children.as_deref_mut().unwrap_or(&mut []);
+        let NodeContent::Directory(children) = &mut self.content else {
+            return;
+        };
 
         if no_size && reverse {
             children.par_sort_unstable_by(|a, b| a.name.cmp(&b.name).reverse());
@@ -356,10 +418,10 @@ impl Node {
     }
 }
 
-fn fast_path_join(path: &Path, name: &OsStr) -> PathBuf {
+fn fast_path_join(path: &Path, name: &Path) -> PathBuf {
     // Assume the result will be {path}/{name} so that in most
     // cases .into_boxed_path() doesn't reallocate.
-    let mut result = OsString::with_capacity(path.as_os_str().len() + 1 + name.len());
+    let mut result = OsString::with_capacity(path.as_os_str().len() + 1 + name.as_os_str().len());
     // Push first onto an OsString to skip the PathBuf::push logic.
     result.push(path);
     let mut result = PathBuf::from(result);
@@ -587,6 +649,8 @@ struct DuArgs {
     threshold: Option<i64>,
 }
 
+static STDERR_IS_TERMINAL: LazyLock<bool> = LazyLock::new(|| stderr().is_terminal());
+
 impl DuArgs {
     fn size_format(&self) -> Option<SizeFormat> {
         match () {
@@ -607,7 +671,7 @@ impl DuArgs {
     }
 
     fn with_output<T>(&self, body: impl FnOnce(&dyn Output) -> T) -> T {
-        if self.no_progress || !stderr().is_terminal() {
+        if self.no_progress || !*STDERR_IS_TERMINAL {
             body(&SimpleOutput)
         } else {
             let total_count = &AtomicUsize::new(0);
@@ -626,20 +690,6 @@ impl DuArgs {
         (self.all || node.is_dir())
             && (!self.summarize || depth == 0)
             && (self.max_depth.map_or(true, |max_depth| depth <= max_depth))
-    }
-}
-
-fn join_strs<const N: usize>(strs: [&str; N]) -> Cow<'_, str> {
-    match &strs as &[&str] {
-        [] => "".into(),
-        [s] | [s, ""] | ["", s] => (*s).into(),
-        _ => {
-            let mut result = String::with_capacity(strs.iter().copied().map(str::len).sum());
-            for s in strs {
-                result.push_str(s);
-            }
-            result.into()
-        }
     }
 }
 
@@ -754,6 +804,16 @@ fn main() -> Result<()> {
 
     let mut items = Vec::with_capacity(count);
 
+    if args.show_total {
+        items.push(FlatNode {
+            path: PathBuf::from("total").into(),
+            size: roots.iter().map(|x| x.size).sum(),
+            target: None,
+            has_children: false,
+            anscestor_is_last: Default::default(),
+        });
+    }
+
     if args.tree {
         // When outputting a tree, sort nodes in the tree first before flattening
         if args.sort || args.reverse {
@@ -762,11 +822,11 @@ fn main() -> Result<()> {
                 .for_each(|root| root.sort_children(args.no_size, args.reverse));
         }
 
-        for root in &roots {
+        for root in roots {
             root.flatten_tree_root(&mut items, &args);
         }
     } else {
-        for root in &roots {
+        for root in roots {
             root.flatten_joined(&mut items, Path::new(""), &args, 0);
         }
 
@@ -797,14 +857,12 @@ fn main() -> Result<()> {
         items.truncate(limit);
     }
 
-    if args.show_total {
-        items.push(FlatNode {
-            path: "total".into(),
-            size: roots.iter().map(|x| x.size).sum(),
-        });
-    }
-
-    let mut output = String::with_capacity(items.iter().map(|item| item.path.len() + 48).sum());
+    let mut output = String::with_capacity(
+        items
+            .iter()
+            .map(|item| item.path.as_os_str().len() + 48)
+            .sum(),
+    );
 
     for item in &items {
         item.format_line(&args, &mut output).unwrap();
@@ -820,9 +878,8 @@ fn div_round_up(size: u64, block_size: u64) -> u64 {
 }
 
 impl FlatNode {
-    fn format_line(&self, args: &DuArgs, out: &mut dyn fmt::Write) -> fmt::Result {
+    fn format_line(&self, args: &DuArgs, out: &mut String) -> fmt::Result {
         let size = self.size;
-        let newline = if args.null { "\0" } else { "\n" };
         let sep = if args.du_compatible { "\t" } else { "  " };
 
         if let Some(format) = args.size_format() {
@@ -843,19 +900,39 @@ impl FlatNode {
                     SizeFormat::Blocks(bs) => write!(out, "{:>12} blocks", div_round_up(size, bs))?,
                 }
             }
-            write!(out, "{}", sep)?;
+            out.push_str(sep);
         }
 
-        write!(out, "{}{newline}", self.path)
+        if args.tree {
+            let mut is_last = self.anscestor_is_last;
+            let parent_is_last = is_last.pop();
+            for depth in 0..is_last.len {
+                out.push_str(if is_last.get(depth) { "  " } else { "│ " });
+            }
+
+            out.push_str(match (parent_is_last, self.has_children) {
+                (None, false) => "○ ",
+                (None, true) => "╷ ",
+                (Some(false), false) => "├─╴ ",
+                (Some(false), true) => "├─╮ ",
+                (Some(true), false) => "╰─╴ ",
+                (Some(true), true) => "╰─╮ ",
+            });
+        }
+
+        write!(out, "{}", self.path.display())?;
+
+        if let Some(target) = &self.target {
+            write!(out, " → {}", target.display())?
+        }
+
+        out.push_str(if args.null { "\0" } else { "\n" });
+
+        Ok(())
     }
 }
 
-fn format_size(
-    bytes: u64,
-    binary: bool,
-    du_compatible: bool,
-    out: &mut dyn fmt::Write,
-) -> fmt::Result {
+fn format_size(bytes: u64, binary: bool, du_compatible: bool, out: &mut String) -> fmt::Result {
     let mut factor: u64 = 1;
     let mut power = 0;
     let mut result = bytes;
