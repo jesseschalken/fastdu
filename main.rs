@@ -9,13 +9,12 @@ use std::borrow::Cow;
 use std::cell::LazyCell;
 use std::cmp::Reverse;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
-use std::fmt::Debug;
 use std::fmt::Write;
 use std::fs::DirEntry;
 use std::fs::Metadata;
-use std::fs::read_link;
 use std::io::Write as _;
 use std::io::{self, IsTerminal, Result, stderr};
 #[cfg(unix)]
@@ -27,18 +26,17 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
 use std::{thread, u64};
 
-/// A simple [`u128`] acting like a [`Vec<bool>`]
+/// A simple [`u64`] acting like a [`Vec<bool>`]
 #[derive(Copy, Clone, Default)]
-struct BoolsVec128 {
-    val: u128,
+struct BoolsVec64 {
+    val: u64,
     len: u8,
 }
 
-impl BoolsVec128 {
+impl BoolsVec64 {
     fn push(&mut self, value: bool) {
         self.set(self.len, value);
         self.len += 1;
@@ -66,7 +64,7 @@ impl BoolsVec128 {
     }
 }
 
-impl Extend<bool> for BoolsVec128 {
+impl Extend<bool> for BoolsVec64 {
     fn extend<T: IntoIterator<Item = bool>>(&mut self, iter: T) {
         for x in iter {
             self.push(x)
@@ -78,8 +76,9 @@ impl Extend<bool> for BoolsVec128 {
 static GLOBAL: MiMalloc = MiMalloc;
 
 struct Node {
-    name: Box<Path>,
-    size: u64,
+    name: Box<OsStr>,
+    total_size: u64,
+    total_count: usize,
     content: NodeContent,
 }
 
@@ -91,30 +90,41 @@ enum NodeContent {
 }
 
 struct FlatNode {
-    size: u64,
-    is_last_child_list: BoolsVec128,
+    total_size: u64,
+    total_count: usize,
+    is_last_child_list: BoolsVec64,
     has_children: bool,
     path: Box<Path>,
     target: Option<Box<Path>>,
 }
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
-struct InodeKey {
-    ino: u64,
-    dev: u64,
+trait NodeLike {
+    fn total_size(&self) -> u64;
+    fn total_count(&self) -> usize;
+    fn path_or_name(&self) -> &Path;
 }
 
-impl InodeKey {
-    fn create(metadata: &Metadata) -> Self {
-        // So metadata is considered used when #[cfg(not(unix))]
-        let _ = metadata;
-        #[cfg(unix)]
-        return Self {
-            ino: metadata.ino(),
-            dev: metadata.dev(),
-        };
-        #[cfg(not(unix))]
-        return Self { ino: 0, dev: 0 };
+impl NodeLike for Node {
+    fn total_size(&self) -> u64 {
+        self.total_size
+    }
+    fn total_count(&self) -> usize {
+        self.total_count
+    }
+    fn path_or_name(&self) -> &Path {
+        Path::new(&self.name)
+    }
+}
+
+impl NodeLike for FlatNode {
+    fn total_size(&self) -> u64 {
+        self.total_size
+    }
+    fn total_count(&self) -> usize {
+        self.total_count
+    }
+    fn path_or_name(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -145,14 +155,14 @@ static BLOCK_SIZE: LazyLock<u64> = LazyLock::new(|| {
 impl Node {
     fn flatten_tree_root(self, output: &mut Vec<FlatNode>, args: &DuArgs) {
         if args.should_output(&self, 0) {
-            self.flatten_tree(output, BoolsVec128::default(), args, 0);
+            self.flatten_tree(output, BoolsVec64::default(), args, 0);
         }
     }
 
     fn flatten_tree(
         self,
         output: &mut Vec<FlatNode>,
-        is_last_child_list: BoolsVec128,
+        is_last_child_list: BoolsVec64,
         args: &DuArgs,
         depth: usize,
     ) {
@@ -172,8 +182,9 @@ impl Node {
 
         output.push(FlatNode {
             is_last_child_list,
-            size: self.size,
-            path: self.name,
+            total_size: self.total_size,
+            total_count: self.total_count,
+            path: PathBuf::from(self.name.into_os_string()).into(),
             has_children: !children.is_empty(),
             target,
         });
@@ -215,96 +226,63 @@ impl Node {
 
         output.push(FlatNode {
             path: path.into(),
-            size: self.size,
+            total_size: self.total_size,
+            total_count: self.total_count,
             has_children,
             is_last_child_list: Default::default(),
             target,
         });
     }
 
-    fn total_count(&self) -> usize {
-        1 + match &self.content {
-            NodeContent::Directory(children) => children.iter().map(Node::total_count).sum(),
-            _ => 0,
+    fn is_dir(&self) -> bool {
+        match self.content {
+            NodeContent::Directory(_) => true,
+            _ => false,
         }
     }
 
-    fn assign_children(
-        &mut self,
-        path: &Path,
-        args: &DuArgs,
-        mut root: Option<InodeKey>,
-        output: &dyn Output,
-        seen: &FxDashSet<InodeKey>,
-    ) -> Result<()> {
-        // If we are a directory with no children, try to read them from disk
+    fn sort_children(&mut self, args: &DuArgs) {
         if let NodeContent::Directory(children) = &mut self.content {
-            if !children.is_empty() {
-                return Ok(());
-            }
+            args.sort_nodelikes(children);
 
-            // Build nodes before recursing on subdirectories so we close the
-            // directory handle and don't get a "Too many open files" error.
+            children
+                .par_iter_mut()
+                .for_each(|child| child.sort_children(args));
+        };
+    }
+}
 
-            // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
-            let mut nodes: Vec<Node> = retry_if_interrupted(|| path.read_dir())
-                .as_mut()
-                .map_err(|e| add_context(e, &path))?
-                .flat_map(|entry| {
-                    entry
-                        .as_ref()
-                        .map_err(|e| add_context(e, &path))
-                        .and_then(|entry| Node::read(None, Some(entry), args, seen, &mut root))
-                        .inspect_err(|e| output.log_error(e))
-                })
-                .flatten()
-                .collect();
+struct Scanner<'a> {
+    output: &'a dyn Output,
+    args: &'a DuArgs,
+    #[allow(unused)]
+    seen: FxDashSet<(u64, u64)>,
+}
 
-            output.add_total(nodes.len());
-
-            nodes = nodes
-                .into_par_iter()
-                .flat_map_iter(|mut node| -> Option<_> {
-                    if node.is_dir() {
-                        let path = fast_path_join(path, &node.name);
-                        // To match behavior of "du", we exclude a directory if we fail to read its children
-                        node.assign_children(&path, args, root, output, seen)
-                            .inspect_err(|e| output.log_error(e))
-                            .ok()?;
-                    }
-                    Some(node)
-                })
-                .collect();
-
-            *children = nodes.into();
-            self.size += children.iter().map(|x| x.size).sum::<u64>();
-        }
-
-        Ok(())
+impl<'a> Scanner<'a> {
+    fn new(args: &'a DuArgs, output: &'a dyn Output) -> Self {
+        let seen = FxDashSet::with_hasher(FxBuildHasher);
+        Self { args, output, seen }
     }
 
-    fn read(
-        path: Option<&Path>,
+    fn scan_impl(
+        &self,
+        parent_path: &Path,
         entry: Option<&DirEntry>,
-        args: &DuArgs,
-        seen: &FxDashSet<InodeKey>,
-        root: &mut Option<InodeKey>,
-    ) -> Result<Option<Node>> {
-        let is_root = entry.is_none();
-        let dereference = args.dereference_all || (is_root && args.dereference_args);
+        #[allow(unused_mut)] mut root_dev: Option<u64>,
+    ) -> Result<Option<impl FnOnce(&Scanner, &Path) -> Result<Node> + use<> + Send>> {
+        let dereference =
+            self.args.dereference_all || (entry.is_none() && self.args.dereference_args);
 
         // We don't always need the full path, and it costs to create it from a DirEntry so do so lazily
-        let path = LazyCell::new(|| -> Cow<'_, Path> {
-            if let Some(path) = path {
-                path.into()
-            } else if let Some(entry) = entry {
-                entry.path().into()
-            } else {
-                unreachable!("Either a Path or DirEntry must be provided")
+        let path = LazyCell::new(|| -> Cow<Path> {
+            match entry {
+                Some(entry) => entry.path().into(),
+                None => parent_path.into(),
             }
         });
 
-        // We don't need metadata with -lz or -li and no -x, so load it as needed.
+        // We don't need metadata with -lz or -li and no -x or -L, so load it as needed.
         let metadata = LazyCell::new(|| {
             if dereference {
                 path.metadata()
@@ -316,20 +294,17 @@ impl Node {
         });
 
         let metadata = || metadata.as_ref().map_err(|e| add_context(e, &path));
-        let inode = || metadata().map(InodeKey::create);
 
-        if args.one_file_system {
-            if let Some(root) = root {
-                if inode()?.dev != root.dev {
+        #[cfg(unix)]
+        if self.args.one_file_system {
+            let dev = metadata()?.dev();
+            if let Some(root) = root_dev {
+                if dev != root {
                     return Ok(None);
                 }
             } else {
-                *root = Some(inode()?)
+                root_dev = Some(dev)
             }
-        }
-
-        if cfg!(unix) && !args.count_links && !seen.insert(inode()?) {
-            return Ok(None);
         }
 
         let file_type = match entry {
@@ -341,88 +316,128 @@ impl Node {
             _ => metadata()?.file_type(),
         };
 
-        let name: PathBuf = if let Some(entry) = entry {
-            entry.file_name().into()
+        #[allow(unused)]
+        let is_dir = file_type.is_dir();
+
+        // This is the exact number of children on macOS and BSD, but on Linux it only counts
+        // subdirectories. On Windows its not available at all.
+        #[cfg(unix)]
+        let num_children = if is_dir { metadata()?.nlink() - 2 } else { 0 } as usize;
+        #[cfg(not(unix))]
+        let num_children = 0usize;
+
+        #[cfg(unix)]
+        if !self.args.count_links && !is_dir {
+            let stat = metadata()?;
+            if stat.nlink() > 1 && !self.seen.insert((stat.dev(), stat.ino())) {
+                return Ok(None);
+            }
+        }
+
+        let name: Option<Box<OsStr>> = entry.map(|e| e.file_name().into());
+
+        let mut total_size = if self.args.no_size || self.args.inodes {
+            0
+        } else if self.args.apparent_size || self.args.bytes {
+            metadata()?.len()
         } else {
-            path.clone().into_owned()
+            get_disk_size(metadata()?)
         };
 
-        let content = if file_type.is_file() {
-            NodeContent::File
-        } else if file_type.is_dir() {
-            NodeContent::Directory(Box::new([]))
-        } else if file_type.is_symlink() && args.tree {
-            NodeContent::Symlink(
-                read_link(&*path)
-                    .map_err(|e| add_context(&e, &path))?
-                    .into(),
-            )
-        } else {
-            NodeContent::Other
-        };
+        // Drop references to the DirEntry and return a continuation
+        // that will read childen and construct a complete Node.
+        Ok(Some(move |scanner: &Scanner, parent_path: &Path| {
+            let path = LazyCell::new(|| -> Cow<Path> {
+                match &name {
+                    Some(name) => fast_path_join(parent_path, name).into(),
+                    None => parent_path.into(),
+                }
+            });
 
-        Ok(Some(Node {
-            name: name.into(),
-            size: if args.no_size || args.inodes {
-                1
-            } else if args.apparent_size || args.bytes {
-                metadata()?.len()
+            let mut total_count = 1;
+
+            let content = if file_type.is_file() {
+                NodeContent::File
+            } else if file_type.is_dir() {
+                let path = &*path;
+
+                let mut funs = Vec::with_capacity(num_children);
+                // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
+                let mut iter = retry_if_interrupted(|| path.read_dir());
+                // as_mut() to avoid moving out of the Result<ReadDir> because it can be large
+                let iter = iter.as_mut().map_err(|e| add_context(e, &path))?;
+
+                loop {
+                    match iter.next() {
+                        Some(Ok(ref entry)) => match scanner.scan_impl(path, Some(entry), root_dev) {
+                            Ok(Some(f)) => funs.push(f),
+                            Ok(None) => continue,
+                            Err(e) => scanner.output.log_error(&e),
+                        },
+                        Some(Err(e)) => scanner.output.log_error(&add_context(&e, &path)),
+                        None => break,
+                    }
+                }
+
+                // num_children is only exact on macOS, so use funs.len() from here
+                let mut results = Vec::<Result<Node>>::with_capacity(funs.len());
+                let mut nodes = Vec::<Node>::with_capacity(funs.len());
+
+                funs.into_par_iter()
+                    .map(|f| f(scanner, &path))
+                    .collect_into_vec(&mut results);
+
+                let mut iter = results.into_iter();
+                loop {
+                    // Match the Option<Result<Node>> as a whole to avoid moving the Result<Node> out first
+                    match iter.next() {
+                        Some(Ok(node)) => nodes.push(node),
+                        Some(Err(e)) => scanner.output.log_error(&e),
+                        None => break,
+                    }
+                }
+
+                scanner.output.add_total(nodes.len());
+
+                for node in &nodes {
+                    total_size += node.total_size;
+                    total_count += node.total_count;
+                }
+
+                NodeContent::Directory(nodes.into())
+            } else if file_type.is_symlink() {
+                let target = if scanner.args.tree {
+                    path.read_link().map_err(|e| add_context(&e, &path))?
+                } else {
+                    PathBuf::new()
+                };
+                NodeContent::Symlink(target.into())
             } else {
-                get_disk_size(metadata()?)
-            },
-            content,
+                NodeContent::Other
+            };
+
+            Ok(Node {
+                name: name.unwrap_or_else(|| parent_path.to_owned().into_os_string().into()),
+                total_size,
+                total_count,
+                content,
+            })
         }))
     }
 
-    fn read_root(
-        path: &Path,
-        args: &DuArgs,
-        output: &dyn Output,
-        seen: &FxDashSet<InodeKey>,
-    ) -> Result<Option<Node>> {
-        let mut root = None;
-        let mut node = Node::read(Some(path), None, args, seen, &mut root)?;
-
-        if let Some(node) = &mut node {
-            node.assign_children(&path, args, root, output, seen)?;
-            output.add_total(1);
-        }
-
-        Ok(node)
-    }
-
-    fn is_dir(&self) -> bool {
-        match self.content {
-            NodeContent::Directory(_) => true,
-            _ => false,
-        }
-    }
-
-    fn sort_children(&mut self, no_size: bool, reverse: bool) {
-        let NodeContent::Directory(children) = &mut self.content else {
-            return;
-        };
-
-        if no_size && reverse {
-            children.par_sort_unstable_by(|a, b| a.name.cmp(&b.name).reverse());
-        } else if no_size {
-            children.par_sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        } else if reverse {
-            children.par_sort_unstable_by_key(|x| Reverse(x.size));
-        } else {
-            children.par_sort_unstable_by_key(|x| x.size);
-        }
-
-        children
-            .par_iter_mut()
-            .for_each(|child| child.sort_children(no_size, reverse));
+    fn scan(&self, path: &Path) -> Result<Option<Node>> {
+        Ok(self
+            .scan_impl(path, None, None)?
+            .map(|f| f(self, path))
+            .transpose()?
+            .inspect(|_| self.output.add_total(1)))
     }
 }
 
-fn fast_path_join(path: &Path, name: &Path) -> PathBuf {
+fn fast_path_join(path: &Path, name: &OsStr) -> PathBuf {
     // Assume the result will be {path}/{name} so that in most
     // cases .into_boxed_path() doesn't reallocate.
-    let mut result = OsString::with_capacity(path.as_os_str().len() + 1 + name.as_os_str().len());
+    let mut result = OsString::with_capacity(path.as_os_str().len() + 1 + name.len());
     // Push first onto an OsString to skip the PathBuf::push logic.
     result.push(path);
     let mut result = PathBuf::from(result);
@@ -692,6 +707,22 @@ impl DuArgs {
             && (!self.summarize || depth == 0)
             && (self.max_depth.map_or(true, |max_depth| depth <= max_depth))
     }
+
+    fn sort_nodelikes(&self, children: &mut [impl NodeLike + Send]) {
+        if self.no_size && self.reverse {
+            children.par_sort_unstable_by(|a, b| a.path_or_name().cmp(&b.path_or_name()).reverse());
+        } else if self.no_size {
+            children.par_sort_unstable_by(|a, b| a.path_or_name().cmp(&b.path_or_name()));
+        } else if self.inodes && self.reverse {
+            children.par_sort_unstable_by_key(|x| Reverse(x.total_count()));
+        } else if self.inodes {
+            children.par_sort_unstable_by_key(|x| x.total_count());
+        } else if self.reverse {
+            children.par_sort_unstable_by_key(|x| Reverse(x.total_size()));
+        } else {
+            children.par_sort_unstable_by_key(|x| x.total_size());
+        }
+    }
 }
 
 enum SizeFormat {
@@ -774,44 +805,42 @@ fn main() -> Result<()> {
     let args = DuArgs::parse();
 
     ThreadPoolBuilder::new()
-        .num_threads(
-            args.num_threads
-                .or_else(|| available_parallelism().ok().map(|x| x.get() * 2))
-                .unwrap_or(0),
-        )
+        .num_threads(args.num_threads.unwrap_or(0))
         .use_current_thread()
         .build_global()
         .expect("Failed to set thread pool");
 
-    let seen = FxDashSet::default();
     let mut roots: Vec<Node> = args.with_output(|output| {
+        let scanner = Scanner::new(&args, output);
+
         args.files_or_directories
             .par_iter()
             .flat_map_iter(|path| {
-                Node::read_root(path.as_ref(), &args, output, &seen)
+                scanner
+                    .scan(path.as_ref())
                     .inspect_err(|e| output.log_error(e))
-                    .ok()
-                    .flatten()
             })
+            .flatten()
             .collect()
     });
 
-    let mut count = roots.iter().map(Node::total_count).sum();
+    let total = FlatNode {
+        path: PathBuf::from("total").into(),
+        total_size: roots.iter().map(|x| x.total_size).sum(),
+        total_count: roots.iter().map(|x| x.total_count).sum(),
+        target: None,
+        has_children: false,
+        is_last_child_list: Default::default(),
+    };
 
-    if args.show_total {
-        count += 1;
+    let mut items = Vec::new();
+
+    if !args.summarize && args.max_depth.is_none() {
+        items.reserve_exact(total.total_count + 1);
     }
 
-    let mut items = Vec::with_capacity(count);
-
     if args.show_total {
-        items.push(FlatNode {
-            path: PathBuf::from("total").into(),
-            size: roots.iter().map(|x| x.size).sum(),
-            target: None,
-            has_children: false,
-            is_last_child_list: Default::default(),
-        });
+        items.push(total);
     }
 
     if args.tree {
@@ -819,7 +848,7 @@ fn main() -> Result<()> {
         if args.sort || args.reverse {
             roots
                 .par_iter_mut()
-                .for_each(|root| root.sort_children(args.no_size, args.reverse));
+                .for_each(|root| root.sort_children(&args));
         }
 
         for root in roots {
@@ -832,24 +861,16 @@ fn main() -> Result<()> {
 
         // When not outputting a tree, sort items after flattening
         if args.sort || args.reverse {
-            if args.no_size && args.reverse {
-                items.par_sort_unstable_by(|a, b| a.path.cmp(&b.path).reverse());
-            } else if args.no_size {
-                items.par_sort_unstable_by(|a, b| a.path.cmp(&b.path));
-            } else if args.reverse {
-                items.par_sort_unstable_by_key(|x| Reverse(x.size));
-            } else {
-                items.par_sort_unstable_by_key(|x| x.size);
-            }
+            args.sort_nodelikes(&mut items);
         }
     }
 
     if let Some(mut threshold) = args.threshold {
         if threshold < 0 {
             threshold *= -1;
-            items.retain(|node| node.size <= threshold as u64);
+            items.retain(|node| node.total_size <= threshold as u64);
         } else {
-            items.retain(|node| node.size >= threshold as u64);
+            items.retain(|node| node.total_size >= threshold as u64);
         }
     }
 
@@ -871,7 +892,7 @@ fn main() -> Result<()> {
     std::io::stdout().lock().write_all(output.as_bytes())
 }
 
-fn div_round_up(size: u64, block_size: u64) -> u64 {
+const fn div_round_up(size: u64, block_size: u64) -> u64 {
     let div = size / block_size;
     let rem = size % block_size;
     if rem == 0 { div } else { div + 1 }
@@ -879,13 +900,14 @@ fn div_round_up(size: u64, block_size: u64) -> u64 {
 
 impl FlatNode {
     fn format_line(&self, args: &DuArgs, out: &mut String) -> fmt::Result {
-        let size = self.size;
+        let size = self.total_size;
+        let count = self.total_count;
         let sep = if args.du_compatible { "\t" } else { "  " };
 
         if let Some(format) = args.size_format() {
             if args.du_compatible {
                 match format {
-                    SizeFormat::Count => write!(out, "{size}")?,
+                    SizeFormat::Count => write!(out, "{count}")?,
                     SizeFormat::Bytes => write!(out, "{size}")?,
                     SizeFormat::Human => format_size(size, true, true, out)?,
                     SizeFormat::SI => format_size(size, false, true, out)?,
@@ -893,7 +915,7 @@ impl FlatNode {
                 }
             } else {
                 match format {
-                    SizeFormat::Count => write!(out, "{size:>16} inodes")?,
+                    SizeFormat::Count => write!(out, "{count:>16} inodes")?,
                     SizeFormat::Bytes => write!(out, "{size:>16} bytes")?,
                     SizeFormat::Human => format_size(size, true, false, out)?,
                     SizeFormat::SI => format_size(size, false, false, out)?,
@@ -922,8 +944,10 @@ impl FlatNode {
 
         write!(out, "{}", self.path.display())?;
 
-        if let Some(target) = &self.target {
-            write!(out, " → {}", target.display())?
+        if args.tree {
+            if let Some(target) = &self.target {
+                write!(out, " → {}", target.display())?
+            }
         }
 
         out.push_str(if args.null { "\0" } else { "\n" });
