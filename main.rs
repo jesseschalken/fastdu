@@ -262,18 +262,19 @@ impl Node {
 
             output.add_total(nodes.len());
 
-            nodes
-                .iter_mut()
-                .filter(|node| node.is_dir())
-                .collect::<Vec<_>>()
+            nodes = nodes
                 .into_par_iter()
-                .with_max_len(1)
-                .for_each(|node| {
+                .flat_map_iter(|mut node| -> Option<_> {
+                    if node.is_dir() {
                     let path = fast_path_join(path, &node.name);
+                        // To match behavior of "du", we exclude a directory if we fail to read its children
                     node.assign_children(&path, args, root, output, seen)
                         .inspect_err(|e| output.log_error(e))
-                        .unwrap_or(());
-                });
+                            .ok()?;
+                    }
+                    Some(node)
+                })
+                .collect();
 
             *children = nodes.into();
             self.size += children.iter().map(|x| x.size).sum::<u64>();
@@ -786,7 +787,6 @@ fn main() -> Result<()> {
     let mut roots: Vec<Node> = args.with_output(|output| {
         args.files_or_directories
             .par_iter()
-            .with_max_len(1)
             .flat_map_iter(|path| {
                 Node::read_root(path.as_ref(), &args, output, &seen)
                     .inspect_err(|e| output.log_error(e))
