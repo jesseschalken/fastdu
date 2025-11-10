@@ -92,7 +92,7 @@ enum NodeContent {
 
 struct FlatNode {
     size: u64,
-    anscestor_is_last: BoolsVec128,
+    is_last_child_list: BoolsVec128,
     has_children: bool,
     path: Box<Path>,
     target: Option<Box<Path>>,
@@ -152,7 +152,7 @@ impl Node {
     fn flatten_tree(
         self,
         output: &mut Vec<FlatNode>,
-        anscestor_is_last: BoolsVec128,
+        is_last_child_list: BoolsVec128,
         args: &DuArgs,
         depth: usize,
     ) {
@@ -171,7 +171,7 @@ impl Node {
         };
 
         output.push(FlatNode {
-            anscestor_is_last,
+            is_last_child_list,
             size: self.size,
             path: self.name,
             has_children: !children.is_empty(),
@@ -180,10 +180,10 @@ impl Node {
 
         if let Some(last_child) = children.pop() {
             for child in children {
-                child.flatten_tree(output, anscestor_is_last.join(false), args, depth + 1);
+                child.flatten_tree(output, is_last_child_list.join(false), args, depth + 1);
             }
 
-            last_child.flatten_tree(output, anscestor_is_last.join(true), args, depth + 1);
+            last_child.flatten_tree(output, is_last_child_list.join(true), args, depth + 1);
         }
     }
 
@@ -217,7 +217,7 @@ impl Node {
             path: path.into(),
             size: self.size,
             has_children,
-            anscestor_is_last: Default::default(),
+            is_last_child_list: Default::default(),
             target,
         });
     }
@@ -266,10 +266,10 @@ impl Node {
                 .into_par_iter()
                 .flat_map_iter(|mut node| -> Option<_> {
                     if node.is_dir() {
-                    let path = fast_path_join(path, &node.name);
+                        let path = fast_path_join(path, &node.name);
                         // To match behavior of "du", we exclude a directory if we fail to read its children
-                    node.assign_children(&path, args, root, output, seen)
-                        .inspect_err(|e| output.log_error(e))
+                        node.assign_children(&path, args, root, output, seen)
+                            .inspect_err(|e| output.log_error(e))
                             .ok()?;
                     }
                     Some(node)
@@ -810,7 +810,7 @@ fn main() -> Result<()> {
             size: roots.iter().map(|x| x.size).sum(),
             target: None,
             has_children: false,
-            anscestor_is_last: Default::default(),
+            is_last_child_list: Default::default(),
         });
     }
 
@@ -904,14 +904,14 @@ impl FlatNode {
         }
 
         if args.tree {
-            let mut is_last = self.anscestor_is_last;
-            let parent_is_last = is_last.pop();
-            for depth in 0..is_last.len {
-                out.push_str(if is_last.get(depth) { "  " } else { "│ " });
+            let mut list = self.is_last_child_list;
+            let is_last_child = list.pop();
+            for depth in 0..list.len {
+                out.push_str(if list.get(depth) { "  " } else { "│ " });
             }
 
-            out.push_str(match (parent_is_last, self.has_children) {
-                (None, false) => "○ ",
+            out.push_str(match (is_last_child, self.has_children) {
+                (None, false) => "• ",
                 (None, true) => "╷ ",
                 (Some(false), false) => "├─╴ ",
                 (Some(false), true) => "├─╮ ",
