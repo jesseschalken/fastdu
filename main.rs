@@ -360,31 +360,42 @@ impl<'a> Scanner<'a> {
                 let path = &*path;
 
                 let mut funs = Vec::with_capacity(num_children);
-                funs.extend(
-                    // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
-                    retry_if_interrupted(|| path.read_dir())
-                        .as_mut()
-                        .map_err(|e| add_context(e, &path))?
-                        .map(|entry| {
-                            let entry = entry.as_ref().map_err(|e| add_context(e, &path))?;
-                            scanner.scan_impl(path, Some(entry), root_dev)
-                        })
-                        .flat_map(Result::transpose),
-                );
+                // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
+                let mut iter = retry_if_interrupted(|| path.read_dir());
+                // as_mut() to avoid moving out of the Result<ReadDir> because it can be large
+                let iter = iter.as_mut().map_err(|e| add_context(e, &path))?;
+
+                loop {
+                    // DirEntry is very large, so take a reference to the Option<Result<DirEntry>>
+                    // immediately to avoid moving it.
+                    match &iter.next() {
+                        Some(Ok(entry)) => match scanner.scan_impl(path, Some(entry), root_dev) {
+                            Ok(Some(f)) => funs.push(f),
+                            Ok(None) => continue,
+                            Err(e) => scanner.output.log_error(&e),
+                        },
+                        Some(Err(e)) => scanner.output.log_error(&add_context(e, &path)),
+                        None => break,
+                    }
+                }
 
                 // num_children is only exact on macOS, so use funs.len() from here
-                let mut results = Vec::with_capacity(funs.len());
-                let mut nodes = Vec::with_capacity(funs.len());
+                let mut results = Vec::<Result<Node>>::with_capacity(funs.len());
+                let mut nodes = Vec::<Node>::with_capacity(funs.len());
 
                 funs.into_par_iter()
-                    .map(|f| f?(scanner, &path))
+                    .map(|f| f(scanner, &path))
                     .collect_into_vec(&mut results);
 
-                nodes.extend(
-                    results
-                        .into_iter()
-                        .flat_map(|result| result.inspect_err(|e| scanner.output.log_error(&e))),
-                );
+                let mut iter = results.into_iter();
+                loop {
+                    // Match the Option<Result<Node>> as a whole to avoid moving the Result<Node> out first
+                    match iter.next() {
+                        Some(Ok(node)) => nodes.push(node),
+                        Some(Err(e)) => scanner.output.log_error(&e),
+                        None => break,
+                    }
+                }
 
                 scanner.output.add_total(nodes.len());
 
