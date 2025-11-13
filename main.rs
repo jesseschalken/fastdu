@@ -317,6 +317,8 @@ impl<'a> Scanner<'a> {
 
         let is_dir = file_type.is_dir();
 
+        // This is the exact number of children on macOS and BSD, but on Linux it only counts
+        // subdirectories. On Windows its not available at all.
         #[cfg(unix)]
         let num_children = if is_dir { metadata()?.nlink() - 2 } else { 0 } as usize;
         #[cfg(not(unix))]
@@ -358,11 +360,8 @@ impl<'a> Scanner<'a> {
                 let path = &*path;
 
                 let mut funs = Vec::with_capacity(num_children);
-                let mut results = Vec::with_capacity(num_children);
-                let mut nodes = Vec::with_capacity(num_children);
-
-                // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
                 funs.extend(
+                    // opendir() can produce EINTR on macOS when reading dirs in ~/Library/{Group ,}Containers
                     retry_if_interrupted(|| path.read_dir())
                         .as_mut()
                         .map_err(|e| add_context(e, &path))?
@@ -373,11 +372,14 @@ impl<'a> Scanner<'a> {
                         .flat_map(Result::transpose),
                 );
 
+                // num_children is only exact on macOS, so use funs.len() from here
+                let mut results = Vec::with_capacity(funs.len());
+                let mut nodes = Vec::with_capacity(funs.len());
+
                 funs.into_par_iter()
                     .map(|f| f?(scanner, &path))
                     .collect_into_vec(&mut results);
 
-                nodes.reserve_exact(results.len());
                 nodes.extend(
                     results
                         .into_iter()
