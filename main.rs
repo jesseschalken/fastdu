@@ -255,6 +255,7 @@ impl Node {
 struct Scanner<'a> {
     output: &'a dyn Output,
     args: &'a DuArgs,
+    #[allow(unused)]
     seen: FxDashSet<(u64, u64)>,
 }
 
@@ -268,7 +269,7 @@ impl<'a> Scanner<'a> {
         &self,
         parent_path: &Path,
         entry: Option<&DirEntry>,
-        mut root_dev: Option<u64>,
+        #[allow(unused_mut)] mut root_dev: Option<u64>,
     ) -> Result<Option<impl FnOnce(&Scanner, &Path) -> Result<Node> + use<> + Send>> {
         let dereference =
             self.args.dereference_all || (entry.is_none() && self.args.dereference_args);
@@ -315,6 +316,7 @@ impl<'a> Scanner<'a> {
             _ => metadata()?.file_type(),
         };
 
+        #[allow(unused)]
         let is_dir = file_type.is_dir();
 
         // This is the exact number of children on macOS and BSD, but on Linux it only counts
