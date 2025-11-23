@@ -368,15 +368,13 @@ impl<'a> Scanner<'a> {
                 let iter = iter.as_mut().map_err(|e| add_context(e, &path))?;
 
                 loop {
-                    // DirEntry is very large, so take a reference to the Option<Result<DirEntry>>
-                    // immediately to avoid moving it.
-                    match &iter.next() {
-                        Some(Ok(entry)) => match scanner.scan_impl(path, Some(entry), root_dev) {
+                    match iter.next() {
+                        Some(Ok(ref entry)) => match scanner.scan_impl(path, Some(entry), root_dev) {
                             Ok(Some(f)) => funs.push(f),
                             Ok(None) => continue,
                             Err(e) => scanner.output.log_error(&e),
                         },
-                        Some(Err(e)) => scanner.output.log_error(&add_context(e, &path)),
+                        Some(Err(e)) => scanner.output.log_error(&add_context(&e, &path)),
                         None => break,
                     }
                 }
@@ -894,7 +892,7 @@ fn main() -> Result<()> {
     std::io::stdout().lock().write_all(output.as_bytes())
 }
 
-fn div_round_up(size: u64, block_size: u64) -> u64 {
+const fn div_round_up(size: u64, block_size: u64) -> u64 {
     let div = size / block_size;
     let rem = size % block_size;
     if rem == 0 { div } else { div + 1 }
